@@ -34,6 +34,7 @@
 #include <cuda_fp16.h>
 #include <math_constants.h>
 
+#include "ops/common/mma.cuh"
 #include "ops/kv_cache/int8_g64_codec.cuh"
 #include "ops/softmax_attention/dense/causal_cache/prompt_common.cuh"
 
@@ -83,14 +84,12 @@ static_assert(kCausalPromptI8FastBc == kPagedKVPageSize);
 static_assert(kCausalPromptI8FastGroups == 4);
 static_assert(CausalPromptI8FastShape<8>::SmemBytes == 100352);
 
+// routes to ops/common/mma.cuh mma_f16_f16acc (Turing-aware: 2x m16n8k8 below sm_80)
 __device__ __forceinline__ void causal_prompt_i8_fast_mma_f16_acc(unsigned& c0, unsigned& c1,
                                                                   unsigned a0, unsigned a1,
                                                                   unsigned a2, unsigned a3,
                                                                   unsigned b0, unsigned b1) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
-                 "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
-                 : "+r"(c0), "+r"(c1)
-                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+    mma_f16_f16acc(c0, c1, a0, a1, a2, a3, b0, b1);
 }
 
 // One ldmatrix.trans b16 lane of an INT8 [key][d] tile holds the codes

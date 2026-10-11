@@ -99,9 +99,19 @@ issue_load_bf16_to_float_vec4(View view, const __nv_bfloat16* __restrict__ gmem_
 // The conversion saturates: finite values beyond the FP16 range become +-65504 instead of
 // infinity, and NaN stays NaN.
 static __device__ __forceinline__ __half2 float2_to_f16x2_clamped(float low, float high) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    // cvt.rn.satfinite.f16x2.f32 (two-input pack) is sm_80+; clamp then convert single.
+    low = fminf(fmaxf(low, -65504.0f), 65504.0f);
+    high = fminf(fmaxf(high, -65504.0f), 65504.0f);
+    const std::uint32_t bits = static_cast<std::uint32_t>(__half_as_ushort(__float2half_rn(low))) |
+                               (static_cast<std::uint32_t>(__half_as_ushort(__float2half_rn(high)))
+                                << 16);
+    return *reinterpret_cast<const __half2*>(&bits);
+#else
     std::uint32_t bits;
     asm("cvt.rn.satfinite.f16x2.f32 %0, %1, %2;" : "=r"(bits) : "f"(high), "f"(low));
     return *reinterpret_cast<const __half2*>(&bits);
+#endif
 }
 
 template <int ROWS, int STRIDE, int THREADS, class View>
@@ -129,9 +139,16 @@ issue_load_f16_to_float_vec4(View view, const __half* __restrict__ gmem_base_row
 // scaled V/K panels it multiplies (shared by every U/W entry), plus the output's decayed A matrix.
 // State-passing operands stay truncated; rounding them changes nothing measurable.
 static __device__ __forceinline__ float round_to_tf32(float value) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    // software round-to-nearest-even onto the 10-bit tf32 mantissa (cvt.rna.tf32 is sm_80+)
+    std::uint32_t bits = __float_as_uint(value);
+    bits += 0x0fffU + ((bits >> 13) & 1U);
+    return __uint_as_float(bits & 0xffffe000U);
+#else
     std::uint32_t bits;
     asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(bits) : "f"(value));
     return __uint_as_float(bits);
+#endif
 }
 
 // Per-token q/k L2 normalization factors rsqrt(sum(x^2) + 1e-6), stored head-major [H_qk, T] so

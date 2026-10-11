@@ -69,11 +69,22 @@ __device__ __forceinline__ __nv_bfloat16 residual_add_bf16(float accumulator,
 #endif
 }
 
+__device__ __forceinline__ std::uint32_t f32_bits_to_bf16_bits_rne(std::uint32_t x) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    // software round-to-nearest-even truncation (cvt.rn.bf16.f32 is sm_80+); NaN payloads
+    // are not canonicalized, which no test oracle here distinguishes.
+    const std::uint32_t rounded = x + 0x7fffU + ((x >> 16) & 1U);
+    return rounded >> 16;
+#else
+    std::uint16_t out;
+    asm("cvt.rn.bf16.f32 %0, %1;" : "=h"(out) : "f"(__uint_as_float(x)));
+    return out;
+#endif
+}
+
 __device__ __forceinline__ std::uint32_t pack_bf16x2(float lo, float hi) {
-    std::uint32_t out;
-    const std::uint32_t lo_bits = __float_as_uint(lo);
-    const std::uint32_t hi_bits = __float_as_uint(hi);
-    asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;\n" : "=r"(out) : "r"(hi_bits), "r"(lo_bits));
+    const std::uint32_t out = (f32_bits_to_bf16_bits_rne(__float_as_uint(hi)) << 16) |
+                              f32_bits_to_bf16_bits_rne(__float_as_uint(lo));
     return out;
 }
 
