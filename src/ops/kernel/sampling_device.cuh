@@ -1,5 +1,19 @@
 #pragma once
 
+// redux.sync max (sm_80+) emulated with shfl; exact for the contiguous
+// low-lane masks used here ((1u << k) - 1)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+__device__ __forceinline__ unsigned int __reduce_max_sync(unsigned int mask, unsigned int value) {
+    const int span_ = 32 - __clz(mask);
+    for (int lane_ = 1; lane_ < span_; ++lane_) {
+        const unsigned int other_ = __shfl_sync(mask, value, lane_);
+        value = value > other_ ? value : other_;
+    }
+    return value;
+}
+#endif
+
+
 // Shared implementation primitives for include/ninfer/ops/sampling.h and
 // include/ninfer/ops/speculative_round.h. The ordering key is exact for finite BF16
 // logits (including numeric-zero ties); candidate storage is bounded by the
