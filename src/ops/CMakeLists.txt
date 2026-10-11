@@ -58,3 +58,17 @@ endif()
 if(CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
   target_compile_definitions(ninfer_ops PUBLIC NINFER_SM120_NVFP4=1 NINFER_SM120_FP8=1)
 endif()
+
+# Turing (sm_75) has no bf16/tf32 MMA and no m16n8k16/m16n8k32 shapes, so the FP8/NVFP4 A16
+# attention-input GEMMs, the native Flash-Next expert banks and the QSA indexer cannot be
+# compiled there. sm75_stubs.cpp keeps the Op boundary link-complete with precise runtime
+# errors, mirroring the sm_86 FP8/NVFP4 A8 pattern above.
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "75")
+  get_target_property(ninfer_ops_sources ninfer_ops SOURCES)
+  list(FILTER ninfer_ops_sources EXCLUDE REGEX "attn_input_proj/fp8/fp8_attn_input_a16_(gemm|small_t)(_unified)?\\.cu$")
+  list(FILTER ninfer_ops_sources EXCLUDE REGEX "attn_input_proj/nvfp4/nvfp4_attn_input_a16\\.cu$")
+  list(FILTER ninfer_ops_sources EXCLUDE REGEX "moe_experts/moe_experts_native\\.cu$")
+  list(FILTER ninfer_ops_sources EXCLUDE REGEX "qsa_indexer/qsa_indexer\\.cu$")
+  set_property(TARGET ninfer_ops PROPERTY SOURCES ${ninfer_ops_sources})
+  target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/sm75_stubs.cpp")
+endif()
