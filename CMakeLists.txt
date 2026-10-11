@@ -11,7 +11,7 @@ endif()
 # 120a is admitted locally as an unqualified target. Consumer Blackwell is Ada-like at the warp
 # level - mma.sync, ldmatrix and cp.async recompile natively, and there is no tcgen05 or tensor
 # memory at all - so the compatibility path below is what actually runs there.
-if(NOT CMAKE_CUDA_ARCHITECTURES MATCHES "^(80|86|89|120a)$")
+if(NOT CMAKE_CUDA_ARCHITECTURES MATCHES "^(75|80|86|89|120a)$")
   message(FATAL_ERROR
     "NInfer supports CMAKE_CUDA_ARCHITECTURES=80, 86, 89 or 120a; got "
     "'${CMAKE_CUDA_ARCHITECTURES}'")
@@ -48,6 +48,7 @@ if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(80|86|89)$" OR NOT NINFER_SM120_NATIVE)
 else()
   set(NINFER_COMPAT_PATH OFF)
 endif()
+
 # Programmatic dependent launch lets a captured decode-graph kernel stage its weights while the
 # kernel before it finishes (src/core/pdl.cuh). It needs sm_90 or newer, so the compatibility path
 # launches in stream order; NINFER_PDL=ON turns it on for a 120a build of that path. The native
