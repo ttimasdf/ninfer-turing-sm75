@@ -1,9 +1,13 @@
 #pragma once
 
+#include <cuda_runtime.h>
+
 #include "ops/linear/q8/q8_geometry.h"
 #include "ops/linear/q8/q8_launch.h"
 
 namespace ninfer::ops::detail {
+
+
 
 using Q8N1024K2048   = Q8LinearGeometry<1024, 2048>;
 using Q8N1024K5120   = Q8LinearGeometry<1024, 5120>;

@@ -11,6 +11,32 @@
 #define NINFER_MMA_PRE_SM80 0
 #endif
 
+#if NINFER_MMA_PRE_SM80
+// Warp-uniform power-of-two scaling for the pre-sm_80 f16-MMA emulations of the wider-range
+// bf16/tf32 shapes: pin the warp-max magnitude near 2^14 (exact on the bit level; mantissas
+// exact in f16 in that window; subnormal flush sits below FP32 accumulation significance).
+__device__ __forceinline__ int mma_warp_max_i32(int v) {
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        const int o = __shfl_xor_sync(0xffffffffu, v, off);
+        v = o > v ? o : v;
+    }
+    return v;
+}
+__device__ __forceinline__ int mma_exponent(unsigned bits) {
+    return (bits == 0) ? -127 : static_cast<int>((bits >> 23) & 0xff) - 127;
+}
+__device__ __forceinline__ float mma_scale_exp2(float x, int e) {
+    unsigned b = __float_as_uint(x);
+    const int exp = static_cast<int>((b >> 23) & 0xff);
+    if (exp == 0 || exp == 255) return x;
+    const int ne = exp + e;
+    if (ne <= 0) return 0.0f;
+    if (ne >= 255) return __uint_as_float(0x7f800000u | (b & 0x80000000u));
+    return __uint_as_float((b & 0x807fffffu) | (static_cast<unsigned>(ne) << 23));
+}
+#endif
+
 namespace ninfer::ops {
 
 
