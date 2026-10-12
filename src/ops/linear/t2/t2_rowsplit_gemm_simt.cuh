@@ -215,6 +215,9 @@ __global__ __launch_bounds__(
         }
 
         cp_wait<kPipelinePrefetch>();
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+        __syncthreads(); // sm75 sync-staged: block-cooperative tiles need the barrier here
+#endif
         __syncwarp();
 
         const int active_groups =

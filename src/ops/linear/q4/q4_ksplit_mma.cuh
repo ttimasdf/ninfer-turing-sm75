@@ -249,6 +249,9 @@ __launch_bounds__(256, MinBlocks) __global__
     }
     pdl::trigger_dependents();
     cp_wait<0>();
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    __syncthreads(); // sm75 sync-staged: block-cooperative tiles need the barrier here
+#endif
 
     // Reduce each tile's K partials: odd K warps publish, even ones fold their neighbour, then K
     // warp 0 sums the even ones.

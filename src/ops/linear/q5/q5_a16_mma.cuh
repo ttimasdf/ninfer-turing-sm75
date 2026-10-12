@@ -253,6 +253,9 @@ void q5_a16_mma_kernel(
         const int stage = k_tile % S;
         if constexpr (BS == S) {
             cp_wait<S - 1>();
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+            __syncthreads(); // sm75 sync-staged: block-cooperative tiles need the barrier here
+#endif
         } else {
             cp_wait<0>();
         }

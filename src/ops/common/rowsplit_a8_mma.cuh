@@ -400,6 +400,9 @@ __global__ __launch_bounds__(kThreads) void a8_mma_kernel(
         const int allowed = issued - (g + 1);
         if (allowed >= 1) {
             cp_wait<1>();
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+            __syncthreads(); // sm75 sync-staged: block-cooperative tiles need the barrier here
+#endif
         } else {
             cp_wait<0>();
         }

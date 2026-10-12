@@ -13,38 +13,6 @@
 
 namespace ninfer::ops {
 
-#if NINFER_MMA_PRE_SM80
-// Warp-uniform power-of-two scaling for the pre-sm_80 f16-MMA emulations of the wider-range
-// bf16/tf32 shapes. bf16 and tf32 carry the FP32 exponent range; decay panels in the GDN
-// family routinely exceed the FP16 range on both ends. Scaling by a power of two is exact
-// on the bit level, and a single scale that pins the warp-max magnitude near 2^14 keeps
-// every term the FP32 accumulator could register representable in FP16: values flushed as
-// subnormal are below 2^-24 of the fragment max, i.e. below accumulation significance.
-__device__ __forceinline__ int mma_warp_max_i32(int v) {
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        const int o = __shfl_xor_sync(0xffffffffu, v, off);
-        v = o > v ? o : v;
-    }
-    return v;
-}
-
-// biased exponent of an f32's bits; zeros map to -127 (harmless for the max)
-__device__ __forceinline__ int mma_exponent(unsigned bits) {
-    return (bits == 0) ? -127 : static_cast<int>((bits >> 23) & 0xff) - 127;
-}
-
-// exact x * 2^e for finite x (bit-level exponent add)
-__device__ __forceinline__ float mma_scale_exp2(float x, int e) {
-    unsigned b = __float_as_uint(x);
-    const int exp = static_cast<int>((b >> 23) & 0xff);
-    if (exp == 0 || exp == 255) return x;  // zero/subnormal/inf/nan: leave (flush is fine below significance)
-    const int ne = exp + e;
-    if (ne <= 0) return 0.0f;              // fully below the scaled window
-    if (ne >= 255) return __uint_as_float(0x7f800000u | (b & 0x80000000u)); // overflow stays inf-signed
-    return __uint_as_float((b & 0x807fffffu) | (static_cast<unsigned>(ne) << 23));
-}
-#endif
 
 
 // The four emulations below split the sm_80 MMA shapes into the shapes Turing (sm_75)
@@ -99,37 +67,40 @@ __device__ __forceinline__ void mma_bf16(float& c0, float& c1, float& c2, float&
                                          unsigned a1, unsigned a2, unsigned a3, unsigned b0,
                                          unsigned b1) {
 #if NINFER_MMA_PRE_SM80
-    // 2x m16n8k8.f16 over scaled operands ({a0,a1}|b0 cover k 0..7, {a2,a3}|b1 k 8..15).
-    // bf16 mantissa (8 bits) is exact in f16; only the exponent range needs a warp-uniform
-    // power-of-two rescale so the max magnitude lands at ~2^14 (see mma_scale_exp2). Terms
-    // lost to f16 subnormal flush sit below FP32 accumulation significance.
-    int ea = mma_exponent(a0);
-    ea = ::max(ea, mma_exponent(a1)); ea = ::max(ea, mma_exponent(a2)); ea = ::max(ea, mma_exponent(a3));
-    int eb = mma_exponent(b0); eb = ::max(eb, mma_exponent(b1));
-    ea = mma_warp_max_i32(ea); eb = mma_warp_max_i32(eb);
-    const int sa = (ea >= 254 || ea <= -126) ? 0 : (ea > 14 ? ea - 14 : 0);
-    const int sb = (eb >= 254 || eb <= -126) ? 0 : (eb > 14 ? eb - 14 : 0);
-    auto bf16x2_scaled_f16x2 = [&](unsigned v, int e) -> unsigned {
-        const float lo = __uint_as_float(v << 16), hi = __uint_as_float(v & 0xffff0000u);
-        const float ls = mma_scale_exp2(lo, -e), hs = mma_scale_exp2(hi, -e);
-        const unsigned l16 = static_cast<unsigned>(__half_as_ushort(__float2half_rn(ls)));
-        const unsigned h16 = static_cast<unsigned>(__half_as_ushort(__float2half_rn(hs)));
-        return l16 | (h16 << 16);
+    // 2x m16n8k8.f16 per k-half ({a0,a1}|b0 cover k 0..7, {a2,a3}|b1 k 8..15) over hi/lo split
+    // operands, with NO cross-lane communication: x = hi + lo, hi = f16(clamped x) exact for
+    // in-range bf16 (8-bit mantissa in 11-bit f16), lo = f16(x - f32(hi)) carrying values beyond
+    // the f16 range up to ~2x65504 and preserving the residual otherwise. Three products carry
+    // hi*hi + hi*lo + lo*hi; lo*lo is below FP32 accumulation significance. Works under warp
+    // divergence (no __shfl_sync), unlike a warp-uniform scale.
+    auto bf16_hi_lo = [](unsigned v, unsigned& lo16) -> unsigned {
+        const float lo = __uint_as_float(v << 16);
+        const float hi = __uint_as_float(v & 0xffff0000u);
+        const float lo_c = fminf(fmaxf(lo, -65504.0f), 65504.0f);
+        const float hi_c = fminf(fmaxf(hi, -65504.0f), 65504.0f);
+        const unsigned lo_h = static_cast<unsigned>(__half_as_ushort(__float2half_rn(lo_c)));
+        const unsigned hi_h = static_cast<unsigned>(__half_as_ushort(__float2half_rn(hi_c)));
+        const unsigned l16 = static_cast<unsigned>(__half_as_ushort(__float2half_rn(lo - __half2float(__ushort_as_half(static_cast<unsigned short>(lo_h))))));
+        const unsigned h16 = static_cast<unsigned>(__half_as_ushort(__float2half_rn(hi - __half2float(__ushort_as_half(static_cast<unsigned short>(hi_h))))));
+        lo16 = l16 | (h16 << 16);
+        return lo_h | (hi_h << 16);
     };
-    const unsigned a0h = bf16x2_scaled_f16x2(a0, sa), a1h = bf16x2_scaled_f16x2(a1, sa);
-    const unsigned a2h = bf16x2_scaled_f16x2(a2, sa), a3h = bf16x2_scaled_f16x2(a3, sa);
-    const unsigned b0h = bf16x2_scaled_f16x2(b0, sb), b1h = bf16x2_scaled_f16x2(b1, sb);
-    float s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f;
-    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
-                 "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
-                 : "+f"(s0), "+f"(s1), "+f"(s2), "+f"(s3)
-                 : "r"(a0h), "r"(a1h), "r"(b0h));
-    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
-                 "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
-                 : "+f"(s0), "+f"(s1), "+f"(s2), "+f"(s3)
-                 : "r"(a2h), "r"(a3h), "r"(b1h));
-    const float undo = mma_scale_exp2(1.0f, sa + sb);
-    c0 += s0 * undo; c1 += s1 * undo; c2 += s2 * undo; c3 += s3 * undo;
+    unsigned al0, al1, al2, al3, bl0, bl1;
+    const unsigned ah0 = bf16_hi_lo(a0, al0), ah1 = bf16_hi_lo(a1, al1);
+    const unsigned ah2 = bf16_hi_lo(a2, al2), ah3 = bf16_hi_lo(a3, al3);
+    const unsigned bh0 = bf16_hi_lo(b0, bl0), bh1 = bf16_hi_lo(b1, bl1);
+#define NINFER_MMA_F16_K8(AH0, AH1, BH)                                                          \
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "                            \
+                 "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"                              \
+                 : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)                                        \
+                 : "r"(AH0), "r"(AH1), "r"(BH))
+    NINFER_MMA_F16_K8(ah0, ah1, bh0);
+    NINFER_MMA_F16_K8(ah2, ah3, bh1);
+    NINFER_MMA_F16_K8(ah0, ah1, bl0);
+    NINFER_MMA_F16_K8(ah2, ah3, bl1);
+    NINFER_MMA_F16_K8(al0, al1, bh0);
+    NINFER_MMA_F16_K8(al2, al3, bh1);
+#undef NINFER_MMA_F16_K8
 #else
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
@@ -235,33 +206,39 @@ __device__ __forceinline__ void mma_tf32_bits(float& c0, float& c1, float& c2, f
                                               unsigned a0, unsigned a1, unsigned a2, unsigned a3,
                                               unsigned b0, unsigned b1) {
 #if NINFER_MMA_PRE_SM80
-    // Turing: tf32-bits operands carry the FP32 exponent range; rescale warp-uniformly so
-    // the max magnitude lands at ~2^14, then one m16n8k8.f16 per step. A tf32 value has a
-    // 10-bit mantissa, exact in f16, so the scaled product needs no hi/lo compensation;
-    // terms flushed below f16 subnormal are below FP32 accumulation significance.
+    // Communication-free hi/lo over the widened (masked) tf32 values, one m16n8k8.f16 step:
+    // a tf32 value has a 10-bit mantissa, exact in f16 within range; lo carries the out-of-range
+    // residual (up to ~2x65504). No __shfl_sync: safe under warp divergence.
     // Layout (probed): a0=(row g,k 2t), a1=(row g+8,k 2t), a2=(row g,k 2t+1), a3=(row g+8,
     // k 2t+1); b0=(col g,k 2t), b1=(col g,k 2t+1); f16 m16n8k8 A halves are k {2t, 2t+1}.
-    int ea = mma_exponent(a0); ea = ::max(ea, mma_exponent(a1));
-    ea = ::max(ea, mma_exponent(a2)); ea = ::max(ea, mma_exponent(a3));
-    int eb = mma_exponent(b0); eb = ::max(eb, mma_exponent(b1));
-    ea = mma_warp_max_i32(ea); eb = mma_warp_max_i32(eb);
-    const int sa = (ea >= 254 || ea <= -126) ? 0 : (ea > 14 ? ea - 14 : 0);
-    const int sb = (eb >= 254 || eb <= -126) ? 0 : (eb > 14 ? eb - 14 : 0);
-    auto tf32_scaled_f16 = [&](unsigned bits, int e) -> unsigned {
-        return static_cast<unsigned>(__half_as_ushort(
-            __float2half_rn(mma_scale_exp2(__uint_as_float(bits & 0xffffe000u), -e))));
+    auto tf32_hi_lo = [&](unsigned bits, unsigned& lo16) -> unsigned {
+        const float v = __uint_as_float(bits & 0xffffe000u);
+        const float vc = fminf(fmaxf(v, -65504.0f), 65504.0f);
+        const unsigned h = static_cast<unsigned>(__half_as_ushort(__float2half_rn(vc)));
+        lo16 = static_cast<unsigned>(__half_as_ushort(__float2half_rn(v - __half2float(__ushort_as_half(static_cast<unsigned short>(h))))));
+        return h;
     };
-    const unsigned a0h = tf32_scaled_f16(a0, sa), a1h = tf32_scaled_f16(a1, sa);
-    const unsigned a2h = tf32_scaled_f16(a2, sa), a3h = tf32_scaled_f16(a3, sa);
-    const unsigned b0h = tf32_scaled_f16(b0, sb), b1h = tf32_scaled_f16(b1, sb);
-    const unsigned ah = a0h | (a2h << 16), al = a1h | (a3h << 16), bh = b0h | (b1h << 16);
+    unsigned a0l, a1l, a2l, a3l, b0l, b1l;
+    const unsigned a0h = tf32_hi_lo(a0, a0l), a1h = tf32_hi_lo(a1, a1l);
+    const unsigned a2h = tf32_hi_lo(a2, a2l), a3h = tf32_hi_lo(a3, a3l);
+    const unsigned b0h = tf32_hi_lo(b0, b0l), b1h = tf32_hi_lo(b1, b1l);
+    const unsigned ah = a0h | (a2h << 16), al = a1h | (a3h << 16);
+    const unsigned ahl = a0l | (a2l << 16), all_ = a1l | (a3l << 16);
+    const unsigned bh = b0h | (b1h << 16), bl = b0l | (b1l << 16);
     float s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f;
     asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
                  "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
                  : "+f"(s0), "+f"(s1), "+f"(s2), "+f"(s3)
                  : "r"(ah), "r"(al), "r"(bh));
-    const float undo = mma_scale_exp2(1.0f, sa + sb);
-    c0 += s0 * undo; c1 += s1 * undo; c2 += s2 * undo; c3 += s3 * undo;
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+                 : "+f"(s0), "+f"(s1), "+f"(s2), "+f"(s3)
+                 : "r"(ah), "r"(al), "r"(bl));
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+                 : "+f"(s0), "+f"(s1), "+f"(s2), "+f"(s3)
+                 : "r"(ahl), "r"(all_), "r"(bh));
+    c0 += s0; c1 += s1; c2 += s2; c3 += s3;
 #else
     asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"

@@ -88,6 +88,11 @@ __device__ __forceinline__ void cp_async_zfill(void* smem_dst, const void* gmem_
 
 __device__ __forceinline__ void cp_commit() {}
 
+// cp_wait is a block barrier: the staged stores above are complete when cp_async returns, and
+// the block-cooperative tile staging in the linear rings takes its cross-thread visibility
+// here. Divergent per-warp wait sites (a cp.async.wait_group executed by only some warps)
+// must NOT call this - they use sync_store_fence_warp()/plain program order instead, since a
+// barrier there would break warp barrier-count pairing (the GDN prepare_wy_wu V-preload).
 template <int Groups>
 __device__ __forceinline__ void cp_wait() {
     static_assert(Groups >= 0 && Groups <= 7, "cp_wait group count must fit the PTX immediate");

@@ -304,6 +304,9 @@ __launch_bounds__(256) __global__
         __syncthreads();
     }
     cp_wait<0>();
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    __syncthreads(); // sm75 sync-staged: block-cooperative tiles need the barrier here
+#endif
 
     // K-warp reduction: odd warps publish, even ones fold, warp 0 sums the rest. Identical to
     // q4_ksplit_mma.cuh's tree; operates on plain floats so it is dtype-agnostic.

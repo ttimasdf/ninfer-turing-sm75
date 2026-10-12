@@ -547,7 +547,11 @@ prepare_wy_wu_kernel(const __nv_bfloat16* __restrict__ k_in, const float* __rest
                                                 col8);
                 }
                 cp_commit();
-                cp_wait<0>();
+                // Divergent per-warp wait (helper warps only): a block barrier here would
+                // desynchronize warp barrier pairing. The staged stores are synchronous on
+                // this path; lane visibility via the warp's own flow, block ordering via the
+                // loop-end barrier or the grid boundary before the output kernel.
+                __syncwarp();
             }
         }
 

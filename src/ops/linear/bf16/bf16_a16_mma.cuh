@@ -88,6 +88,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_m
         const int stage = k_tile % S;
         if (k_tile + S <= kTiles) {
             cp_wait<S - 1>();
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+            __syncthreads(); // sm75 sync-staged: block-cooperative tiles need the barrier here
+#endif
         } else {
             // Once the producer stops refilling the ring, fewer than S groups remain. Drain them
             // instead of applying the steady-state wait count to the final consumer stage.
