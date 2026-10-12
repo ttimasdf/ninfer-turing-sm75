@@ -9,6 +9,7 @@
 // row.col MMA atom. M and K come from a compiled geometry; N remains runtime.
 
 #include "ops/common/mma.cuh"
+#include "ops/common/math.cuh"
 
 #include <cuda_bf16.h>
 
@@ -247,6 +248,12 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) void bf16
                     a_frag[mi][0], a_frag[mi][1], a_frag[mi][2], a_frag[mi][3],
                     smem_addr(
                         &As[stage * BM * BK + row * BK + bf16_mma_shared_col<Schedule>(row, col)]));
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+                a_frag[mi][0] = bf16x2_bits_to_f16x2_sat(a_frag[mi][0]);
+                a_frag[mi][1] = bf16x2_bits_to_f16x2_sat(a_frag[mi][1]);
+                a_frag[mi][2] = bf16x2_bits_to_f16x2_sat(a_frag[mi][2]);
+                a_frag[mi][3] = bf16x2_bits_to_f16x2_sat(a_frag[mi][3]);
+#endif  // pre-sm_80: f16 fragments -> mma_f16 (no per-MMA conversion)
             }
 #pragma unroll
             for (int ni = 0; ni < NT; ++ni) {
@@ -256,6 +263,10 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) void bf16
                     b_frag[ni][0], b_frag[ni][1],
                     smem_addr(
                         &Bs[stage * BN * BK + row * BK + bf16_mma_shared_col<Schedule>(row, col)]));
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+                b_frag[ni][0] = bf16x2_bits_to_f16x2_sat(b_frag[ni][0]);
+                b_frag[ni][1] = bf16x2_bits_to_f16x2_sat(b_frag[ni][1]);
+#endif  // pre-sm_80: f16 fragments -> mma_f16 (no per-MMA conversion)
             }
         };
 
@@ -273,7 +284,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) void bf16
                 for (int mi = 0; mi < MT; ++mi) {
 #pragma unroll
                     for (int ni = 0; ni < NT; ++ni) {
-                        mma_bf16(accum[mi][ni][0], accum[mi][ni][1], accum[mi][ni][2],
+                        mma_f16(accum[mi][ni][0], accum[mi][ni][1], accum[mi][ni][2],
                                  accum[mi][ni][3], a_frag[slot][mi][0], a_frag[slot][mi][1],
                                  a_frag[slot][mi][2], a_frag[slot][mi][3], b_frag[slot][ni][0],
                                  b_frag[slot][ni][1]);
@@ -290,7 +301,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) void bf16
                 for (int mi = 0; mi < MT; ++mi) {
 #pragma unroll
                     for (int ni = 0; ni < NT; ++ni) {
-                        mma_bf16(accum[mi][ni][0], accum[mi][ni][1], accum[mi][ni][2],
+                        mma_f16(accum[mi][ni][0], accum[mi][ni][1], accum[mi][ni][2],
                                  accum[mi][ni][3], a_frag[mi][0], a_frag[mi][1], a_frag[mi][2],
                                  a_frag[mi][3], b_frag[ni][0], b_frag[ni][1]);
                     }

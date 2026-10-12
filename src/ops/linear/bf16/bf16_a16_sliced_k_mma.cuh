@@ -1,3 +1,4 @@
+#include "ops/common/math.cuh"
 #pragma once
 // Warps share an output tile and partition K. FP32 fragments are reduced before the epilogue.
 #include "core/pdl.cuh"
@@ -86,6 +87,12 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_s
                 ldmatrix_x4(a_frag[0], a_frag[1], a_frag[2], a_frag[3],
                             smem_addr(weight_shared + a_row * kBlockK +
                                       bf16_mma_shared_col<Schedule>(a_row, a_col)));
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+                a_frag[0] = bf16x2_bits_to_f16x2_sat(a_frag[0]);
+                a_frag[1] = bf16x2_bits_to_f16x2_sat(a_frag[1]);
+                a_frag[2] = bf16x2_bits_to_f16x2_sat(a_frag[2]);
+                a_frag[3] = bf16x2_bits_to_f16x2_sat(a_frag[3]);
+#endif  // pre-sm_80: f16 fragments -> mma_f16 (no per-MMA conversion)
 #pragma unroll
                 for (int ni = 0; ni < kTokenMmas; ++ni) {
                     unsigned b_frag[2];
@@ -94,8 +101,12 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_s
                     ldmatrix_x2(b_frag[0], b_frag[1],
                                 smem_addr(x_shared + b_row * kBlockK +
                                           bf16_mma_shared_col<Schedule>(b_row, b_col)));
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+                b_frag[0] = bf16x2_bits_to_f16x2_sat(b_frag[0]);
+                b_frag[1] = bf16x2_bits_to_f16x2_sat(b_frag[1]);
+#endif  // pre-sm_80: f16 fragments -> mma_f16 (no per-MMA conversion)
                     auto& c = accum[mi * kTokenMmas + ni];
-                    mma_bf16(c[0], c[1], c[2], c[3], a_frag[0], a_frag[1], a_frag[2], a_frag[3],
+                    mma_f16(c[0], c[1], c[2], c[3], a_frag[0], a_frag[1], a_frag[2], a_frag[3],
                              b_frag[0], b_frag[1]);
                 }
             }

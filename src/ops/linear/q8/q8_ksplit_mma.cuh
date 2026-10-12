@@ -54,6 +54,29 @@ __device__ __forceinline__ unsigned q8_ksplit_bf16_pair_from_s8(unsigned values)
     return result.bits;
 }
 
+// Pre-sm_80 route: the same exponent-bias trick against f16 (bias 1024.0, sign adds 256 more).
+// int8 values are exact in f16's 11-bit significand, so fragments feed mma_f16 directly:
+// two native m16n8k8 MMAs per step and no per-MMA conversion math (see mma.cuh).
+__device__ __forceinline__ unsigned q8_ksplit_f16_pair_from_s8(unsigned values) {
+    const unsigned r_lo = static_cast<unsigned>(__half_as_ushort(
+        __float2half_rn(static_cast<float>(static_cast<std::int8_t>(values & 0xffu)))));
+    const unsigned r_hi = static_cast<unsigned>(__half_as_ushort(
+        __float2half_rn(static_cast<float>(static_cast<std::int8_t>((values >> 8) & 0xffu)))));
+    return r_lo | (r_hi << 16);
+}
+
+// bf16 activation pair -> f16 pair, saturating at the f16 range (activations beyond +-65504
+// clamp; in-range bf16 is exact in f16).
+__device__ __forceinline__ unsigned q8_ksplit_bf16x2_to_f16x2_sat(unsigned bits) {
+    const float lo = __uint_as_float(bits << 16);
+    const float hi = __uint_as_float(bits & 0xffff0000u);
+    const unsigned l = static_cast<unsigned>(
+        __half_as_ushort(__float2half_rn(fminf(fmaxf(lo, -65504.0f), 65504.0f))));
+    const unsigned h = static_cast<unsigned>(
+        __half_as_ushort(__float2half_rn(fminf(fmaxf(hi, -65504.0f), 65504.0f))));
+    return l | (h << 16);
+}
+
 // The contraction owns the shared layout; tiled launchers use the same type for opt-in capacity.
 template <class Schedule>
 union alignas(16) Q8KSplitSharedStorage {
@@ -248,6 +271,26 @@ q8_ksplit_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restric
                     return static_cast<unsigned>(
                         *reinterpret_cast<const unsigned short*>(&code_shared[code_row][offset]));
                 };
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+                const unsigned af0 = q8_ksplit_f16_pair_from_s8(load_code_pair(gid, code_col));
+                const unsigned af1 = q8_ksplit_f16_pair_from_s8(load_code_pair(gid + 8, code_col));
+                const unsigned af2 = q8_ksplit_f16_pair_from_s8(load_code_pair(gid, code_col + 8));
+                const unsigned af3 =
+                    q8_ksplit_f16_pair_from_s8(load_code_pair(gid + 8, code_col + 8));
+#pragma unroll
+                for (int ni = 0; ni < kNt; ++ni) {
+                    unsigned bf0, bf1;
+                    const int br = ni * 8 + b_rin;
+                    ldmatrix_x2(
+                        bf0, bf1,
+                        smem_addr(&b_shared[k_split][br * kTileK +
+                                                     q8_ksplit_swizzle_64(br, ks * 16 + b_koff)]));
+                    const unsigned f0 = q8_ksplit_bf16x2_to_f16x2_sat(bf0);
+                    const unsigned f1 = q8_ksplit_bf16x2_to_f16x2_sat(bf1);
+                    mma_f16(group_acc[ni][0], group_acc[ni][1], group_acc[ni][2], group_acc[ni][3],
+                            af0, af1, af2, af3, f0, f1);
+                }
+#else
                 const unsigned af0 = q8_ksplit_bf16_pair_from_s8(load_code_pair(gid, code_col));
                 const unsigned af1 = q8_ksplit_bf16_pair_from_s8(load_code_pair(gid + 8, code_col));
                 const unsigned af2 = q8_ksplit_bf16_pair_from_s8(load_code_pair(gid, code_col + 8));
@@ -264,6 +307,7 @@ q8_ksplit_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restric
                     mma_bf16(group_acc[ni][0], group_acc[ni][1], group_acc[ni][2], group_acc[ni][3],
                              af0, af1, af2, af3, bf0, bf1);
                 }
+#endif
             }
             const unsigned top_bits = group == 0 ? top_scale_pair & 0xffffu : top_scale_pair >> 16;
             const unsigned bot_bits = group == 0 ? bot_scale_pair & 0xffffu : bot_scale_pair >> 16;

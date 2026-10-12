@@ -100,6 +100,18 @@ __device__ __forceinline__ std::uint32_t pack_f16x2(float lo, float hi) {
     return load_vec<std::uint32_t>(&packed);
 }
 
+// bf16 pair -> f16 pair, saturating at the f16 range: in-range bf16 is exact in f16, values
+// beyond +-65504 clamp. Feeds mma_f16 on pre-sm_80 builds (see common/mma.cuh).
+__device__ __forceinline__ std::uint32_t bf16x2_bits_to_f16x2_sat(std::uint32_t bits) {
+    const float lo = __uint_as_float(bits << 16);
+    const float hi = __uint_as_float(bits & 0xffff0000U);
+    const unsigned l = static_cast<unsigned>(
+        __half_as_ushort(__float2half_rn(fminf(fmaxf(lo, -65504.0f), 65504.0f))));
+    const unsigned h = static_cast<unsigned>(
+        __half_as_ushort(__float2half_rn(fminf(fmaxf(hi, -65504.0f), 65504.0f))));
+    return l | (h << 16);
+}
+
 __device__ __forceinline__ std::uint32_t bf16x2_bits_to_f16x2_bits(std::uint32_t bits) {
     const __nv_bfloat162 source = load_vec<__nv_bfloat162>(&bits);
     const __half2 converted =

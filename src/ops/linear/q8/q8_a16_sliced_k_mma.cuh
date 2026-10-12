@@ -11,6 +11,7 @@
 
 #include "core/pdl.cuh"
 #include "ops/common/mma.cuh"
+#include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/linear/q8/q8_schedule.cuh"
 #include "ops/linear/q8/q8_operands.h"
@@ -42,6 +43,15 @@ union Q8Bf16PairBits {
     __nv_bfloat162 pair;
     unsigned bits;
 };
+
+// Pre-sm_80 route: exact int8 in f16, feeds mma_f16 without per-MMA conversions.
+__device__ __forceinline__ unsigned q8_f16_pair_from_s8(unsigned values) {
+    const unsigned r_lo = static_cast<unsigned>(__half_as_ushort(
+        __float2half_rn(static_cast<float>(static_cast<std::int8_t>(values & 0xffu)))));
+    const unsigned r_hi = static_cast<unsigned>(__half_as_ushort(
+        __float2half_rn(static_cast<float>(static_cast<std::int8_t>((values >> 8) & 0xffu)))));
+    return r_lo | (r_hi << 16);
+}
 
 __device__ __forceinline__ unsigned q8_bf16_pair_from_s8(unsigned values) {
     Q8Bf16PairBits biased;
@@ -330,10 +340,17 @@ __device__ __forceinline__ void q8_a16_sliced_k_mma(Q8LinearOperands operands, O
 #pragma unroll
                 for (int tile = 0; tile < kRowTiles; ++tile) {
                     const int top = tile * 16 + gid;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+                    af[tile][0]   = q8_f16_pair_from_s8(load_code_pair(top, code_col));
+                    af[tile][1]   = q8_f16_pair_from_s8(load_code_pair(top + 8, code_col));
+                    af[tile][2]   = q8_f16_pair_from_s8(load_code_pair(top, code_col + 8));
+                    af[tile][3]   = q8_f16_pair_from_s8(load_code_pair(top + 8, code_col + 8));
+#else
                     af[tile][0]   = q8_bf16_pair_from_s8(load_code_pair(top, code_col));
                     af[tile][1]   = q8_bf16_pair_from_s8(load_code_pair(top + 8, code_col));
                     af[tile][2]   = q8_bf16_pair_from_s8(load_code_pair(top, code_col + 8));
                     af[tile][3]   = q8_bf16_pair_from_s8(load_code_pair(top + 8, code_col + 8));
+#endif
                 }
 #pragma unroll
                 for (int ni = 0; ni < kNt; ++ni) {
@@ -343,12 +360,23 @@ __device__ __forceinline__ void q8_a16_sliced_k_mma(Q8LinearOperands operands, O
                         bf0, bf1,
                         smem_addr(&b_shared[k_split][br * kTileK + q8_sliced_k_swizzle_64(
                                                                        br, ks * 16 + b_koff)]));
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+                    const unsigned f0 = bf16x2_bits_to_f16x2_sat(bf0);
+                    const unsigned f1 = bf16x2_bits_to_f16x2_sat(bf1);
+#pragma unroll
+                    for (int tile = 0; tile < kRowTiles; ++tile) {
+                        mma_f16(group_acc[tile][ni][0], group_acc[tile][ni][1],
+                                group_acc[tile][ni][2], group_acc[tile][ni][3], af[tile][0],
+                                af[tile][1], af[tile][2], af[tile][3], f0, f1);
+                    }
+#else
 #pragma unroll
                     for (int tile = 0; tile < kRowTiles; ++tile) {
                         mma_bf16(group_acc[tile][ni][0], group_acc[tile][ni][1],
                                  group_acc[tile][ni][2], group_acc[tile][ni][3], af[tile][0],
                                  af[tile][1], af[tile][2], af[tile][3], bf0, bf1);
                     }
+#endif
                 }
             }
             const bool live_group = FullWeights || group_k0 + warp_koff + group * 32 < kHidden;

@@ -8,6 +8,7 @@
 #include "core/pdl.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
+#include "ops/common/math.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -120,6 +121,12 @@ __global__ __launch_bounds__(Schedule::kThreads, 1) void bf16_n256_k5120_mma_ker
             ldmatrix_x4(a_frag[0], a_frag[1], a_frag[2], a_frag[3],
                         smem_addr(&weight_shared[a_row_offset * kGroupK +
                                                  bf16_n256_k5120_swizzle(a_row_offset, a_col)]));
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+                a_frag[0] = bf16x2_bits_to_f16x2_sat(a_frag[0]);
+                a_frag[1] = bf16x2_bits_to_f16x2_sat(a_frag[1]);
+                a_frag[2] = bf16x2_bits_to_f16x2_sat(a_frag[2]);
+                a_frag[3] = bf16x2_bits_to_f16x2_sat(a_frag[3]);
+#endif  // pre-sm_80: f16 fragments -> mma_f16 (no per-MMA conversion)
 #pragma unroll
             for (int token_mma = 0; token_mma < kTokenMmas; ++token_mma) {
                 unsigned b_frag[2];
@@ -128,7 +135,11 @@ __global__ __launch_bounds__(Schedule::kThreads, 1) void bf16_n256_k5120_mma_ker
                 ldmatrix_x2(
                     b_frag[0], b_frag[1],
                     smem_addr(&x_shared[b_row * kGroupK + bf16_n256_k5120_swizzle(b_row, b_col)]));
-                mma_bf16(accum[token_mma][0], accum[token_mma][1], accum[token_mma][2],
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+                b_frag[0] = bf16x2_bits_to_f16x2_sat(b_frag[0]);
+                b_frag[1] = bf16x2_bits_to_f16x2_sat(b_frag[1]);
+#endif  // pre-sm_80: f16 fragments -> mma_f16 (no per-MMA conversion)
+                mma_f16(accum[token_mma][0], accum[token_mma][1], accum[token_mma][2],
                          accum[token_mma][3], a_frag[0], a_frag[1], a_frag[2], a_frag[3], b_frag[0],
                          b_frag[1]);
             }
