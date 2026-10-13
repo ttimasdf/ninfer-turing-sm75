@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ops/common/math.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/linear/q6/q6_schedule.cuh"
 
@@ -19,6 +20,16 @@ __device__ __forceinline__ unsigned q6_sliced_k_integer_pair(std::uint8_t code, 
 
     pair.value = __floats2bfloat162_rn(float(q0), float(q1));
     return pair.bits;
+}
+
+// Q6 codes are in [-32, 31] and are exact in f16. This is the pre-sm_80 operand form;
+// the native BF16 representation remains unchanged on SM80+.
+__device__ __forceinline__ unsigned q6_sliced_k_integer_pair_f16(std::uint8_t code,
+                                                                std::uint8_t high, int shift) {
+    const int q0 = ((int(code & 15) | (((high >> shift) & 3) << 4)) ^ 32) - 32;
+    const int q1 = ((int(code >> 4) | (((high >> (shift + 2)) & 3) << 4)) ^ 32) - 32;
+    const __half2 pair = __floats2half2_rn(float(q0), float(q1));
+    return load_vec<std::uint32_t>(&pair);
 }
 
 __device__ __forceinline__ int q6_sliced_k_swizzle(int row, int col) {
@@ -139,10 +150,27 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q6_a16_sli
                                                     shared.staging.high[slot][row][warp][byte / 2],
                                                     (byte & 1) * 4);
                 };
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+                const unsigned a0 = q6_sliced_k_integer_pair_f16(
+                    shared.staging.codes[slot][r0][warp][byte0],
+                    shared.staging.high[slot][r0][warp][byte0 / 2], (byte0 & 1) * 4);
+                const unsigned a1 = q6_sliced_k_integer_pair_f16(
+                    shared.staging.codes[slot][r0 + 8][warp][byte0],
+                    shared.staging.high[slot][r0 + 8][warp][byte0 / 2], (byte0 & 1) * 4);
+                const unsigned a2 = q6_sliced_k_integer_pair_f16(
+                    shared.staging.codes[slot][r0][warp][byte0 + 4],
+                    shared.staging.high[slot][r0][warp][(byte0 + 4) / 2],
+                    ((byte0 + 4) & 1) * 4);
+                const unsigned a3 = q6_sliced_k_integer_pair_f16(
+                    shared.staging.codes[slot][r0 + 8][warp][byte0 + 4],
+                    shared.staging.high[slot][r0 + 8][warp][(byte0 + 4) / 2],
+                    ((byte0 + 4) & 1) * 4);
+#else
                 const unsigned a0 = decode(r0, byte0);
                 const unsigned a1 = decode(r0 + 8, byte0);
                 const unsigned a2 = decode(r0, byte0 + 4);
                 const unsigned a3 = decode(r0 + 8, byte0 + 4);
+#endif
 #pragma unroll
                 for (int ni = 0; ni < NT; ++ni) {
                     const int br = ni * 8 + (lane & 7);
@@ -151,8 +179,15 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q6_a16_sli
                     ldmatrix_x2(
                         b0, b1,
                         smem_addr(&shared.staging.x[slot][warp][br][q6_sliced_k_swizzle(br, bk)]));
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+                    b0 = bf16x2_bits_to_f16x2_sat(b0);
+                    b1 = bf16x2_bits_to_f16x2_sat(b1);
+                    mma_f16(group_acc[mi][ni][0], group_acc[mi][ni][1], group_acc[mi][ni][2],
+                            group_acc[mi][ni][3], a0, a1, a2, a3, b0, b1);
+#else
                     mma_bf16(group_acc[mi][ni][0], group_acc[mi][ni][1], group_acc[mi][ni][2],
                              group_acc[mi][ni][3], a0, a1, a2, a3, b0, b1);
+#endif
                 }
             }
         }

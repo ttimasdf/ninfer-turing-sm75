@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/pdl.cuh"
+#include "ops/common/math.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/linear/q4/q4_schedule.cuh"
 
@@ -30,6 +31,15 @@ __device__ __forceinline__ unsigned q4_sliced_k_integer_pair(std::uint8_t code) 
 
     pair.value = __floats2bfloat162_rn(float(q0), float(q1));
     return pair.bits;
+}
+
+// Q4 codes are small integers, so they are exact in f16. Keep the native BF16 materialization
+// above for SM80+, but feed the Turing MMA directly with the narrower representation.
+__device__ __forceinline__ unsigned q4_sliced_k_integer_pair_f16(std::uint8_t code) {
+    const int q0 = (int(code & 15) ^ 8) - 8;
+    const int q1 = (int(code >> 4) ^ 8) - 8;
+    const __half2 pair = __floats2half2_rn(float(q0), float(q1));
+    return load_vec<std::uint32_t>(&pair);
 }
 
 __device__ __forceinline__ int q4_sliced_k_swizzle(int row, int col) {
@@ -152,10 +162,21 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q4_a16_sli
                 const auto decode = [&](int row, int byte) {
                     return q4_sliced_k_integer_pair(shared.staging.codes[slot][row][warp][byte]);
                 };
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+                const unsigned a0 = q4_sliced_k_integer_pair_f16(
+                    shared.staging.codes[slot][r0][warp][byte0]);
+                const unsigned a1 = q4_sliced_k_integer_pair_f16(
+                    shared.staging.codes[slot][r0 + 8][warp][byte0]);
+                const unsigned a2 = q4_sliced_k_integer_pair_f16(
+                    shared.staging.codes[slot][r0][warp][byte0 + 4]);
+                const unsigned a3 = q4_sliced_k_integer_pair_f16(
+                    shared.staging.codes[slot][r0 + 8][warp][byte0 + 4]);
+#else
                 const unsigned a0 = decode(r0, byte0);
                 const unsigned a1 = decode(r0 + 8, byte0);
                 const unsigned a2 = decode(r0, byte0 + 4);
                 const unsigned a3 = decode(r0 + 8, byte0 + 4);
+#endif
 #pragma unroll
                 for (int ni = 0; ni < NT; ++ni) {
                     const int br = ni * 8 + (lane & 7);
@@ -164,8 +185,15 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q4_a16_sli
                     ldmatrix_x2(
                         b0, b1,
                         smem_addr(&shared.staging.x[slot][warp][br][q4_sliced_k_swizzle(br, bk)]));
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+                    b0 = bf16x2_bits_to_f16x2_sat(b0);
+                    b1 = bf16x2_bits_to_f16x2_sat(b1);
+                    mma_f16(group_acc[mi][ni][0], group_acc[mi][ni][1], group_acc[mi][ni][2],
+                            group_acc[mi][ni][3], a0, a1, a2, a3, b0, b1);
+#else
                     mma_bf16(group_acc[mi][ni][0], group_acc[mi][ni][1], group_acc[mi][ni][2],
                              group_acc[mi][ni][3], a0, a1, a2, a3, b0, b1);
+#endif
                 }
             }
         }

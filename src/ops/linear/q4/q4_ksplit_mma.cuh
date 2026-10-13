@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "core/pdl.cuh"
+#include "ops/common/math.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/small_t_layout.cuh"
@@ -14,6 +15,15 @@
 #include <type_traits>
 
 namespace ninfer::ops::detail {
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+__device__ __forceinline__ void q4_ksplit_decode_eight_f16(unsigned word, unsigned (&out)[4]) {
+    unsigned bf16[4];
+    Q4MmaDecodeAtom::decode_eight(word, bf16);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) { out[i] = bf16x2_bits_to_f16x2_sat(bf16[i]); }
+}
+#endif
 
 struct Q4KSplitStoreEpilogue {};
 
@@ -209,8 +219,13 @@ __launch_bounds__(256, MinBlocks) __global__
             unsigned a_top[kTpw][4], a_bot[kTpw][4];
 #pragma unroll
             for (int t = 0; t < kTpw; ++t) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+                q4_ksplit_decode_eight_f16(half == 0 ? top[t].x : top[t].y, a_top[t]);
+                q4_ksplit_decode_eight_f16(half == 0 ? bot[t].x : bot[t].y, a_bot[t]);
+#else
                 Q4MmaDecodeAtom::decode_eight(half == 0 ? top[t].x : top[t].y, a_top[t]);
                 Q4MmaDecodeAtom::decode_eight(half == 0 ? bot[t].x : bot[t].y, a_bot[t]);
+#endif
             }
 #pragma unroll
             for (int nt = 0; nt < kNt; ++nt) {
@@ -219,13 +234,26 @@ __launch_bounds__(256, MinBlocks) __global__
                 if (col < live_columns) {
                     b = load_vec<uint4>(&stage.activations[k_split][col][16 * lid + 8 * half]);
                 }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+                const unsigned f0 = bf16x2_bits_to_f16x2_sat(b.x);
+                const unsigned f1 = bf16x2_bits_to_f16x2_sat(b.y);
+                const unsigned f2 = bf16x2_bits_to_f16x2_sat(b.z);
+                const unsigned f3 = bf16x2_bits_to_f16x2_sat(b.w);
+#endif
 #pragma unroll
                 for (int t = 0; t < kTpw; ++t) {
                     float(&g)[4] = group_acc[t][nt];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+                    mma_f16(g[0], g[1], g[2], g[3], a_top[t][0], a_bot[t][0], a_top[t][1],
+                            a_bot[t][1], f0, f1);
+                    mma_f16(g[0], g[1], g[2], g[3], a_top[t][2], a_bot[t][2], a_top[t][3],
+                            a_bot[t][3], f2, f3);
+#else
                     mma_bf16(g[0], g[1], g[2], g[3], a_top[t][0], a_bot[t][0], a_top[t][1],
                              a_bot[t][1], b.x, b.y);
                     mma_bf16(g[0], g[1], g[2], g[3], a_top[t][2], a_bot[t][2], a_top[t][3],
                              a_bot[t][3], b.z, b.w);
+#endif
                 }
             }
         }
