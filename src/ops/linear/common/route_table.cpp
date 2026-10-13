@@ -63,8 +63,15 @@ constexpr std::array<WidthBand, 7> kRtx5090Fp8{
 constexpr std::array<WidthBand, 4> kRtx5090Nvfp4{{{3, 22}, {24, 200}, {216, 224}, {320, 384}}};
 constexpr std::array<WidthBand, 1> kRtx5090Bf16{{{6, 1024}}};
 
+constexpr std::array<WidthBand, 1> kTuringQ4{{{1, 1024}}};
+constexpr std::array<WidthBand, 1> kTuringQ5{{{1, 1024}}};
+constexpr std::array<WidthBand, 1> kTuringQ6{{{1, 1024}}};
+constexpr std::array<WidthBand, 1> kTuringQ8{{{1, 1024}}};
+constexpr std::array<WidthBand, 1> kTuringBf16{{{1, 1024}}};
+
 enum class DeviceClass : std::uint8_t {
     Unmeasured,
+    Sm75,
     Sm86,
     Sm89,
     Sm12x,
@@ -72,6 +79,10 @@ enum class DeviceClass : std::uint8_t {
 
 FamilyBands bands_for(DeviceClass device) {
     switch (device) {
+    case DeviceClass::Sm75:
+        // Turing compatibility routes: the pre-sm_80 port keeps the unified fragment
+        // kernels, while the inherited legacy tables assume SM80+ instruction paths.
+        return {kTuringQ4, kTuringQ5, kTuringQ6, kTuringQ8, {}, {}, kTuringBf16};
     case DeviceClass::Sm86:
         return {kRtx3090Q4,  kRtx3090Q5,    kRtx3090Q6,  kRtx3090Q8,
                 kRtx3090Fp8, kRtx3090Nvfp4, kRtx3090Bf16};
@@ -130,6 +141,7 @@ DeviceClass classify(int device) {
         cudaGetLastError();
         return DeviceClass::Unmeasured;
     }
+    if (major == 7 && minor == 5) return DeviceClass::Sm75;
     if (major == 8 && minor == 6) return DeviceClass::Sm86;
     if (major == 8 && minor == 9) return DeviceClass::Sm89;
     if (major == 12) return DeviceClass::Sm12x;
