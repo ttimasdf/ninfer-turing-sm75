@@ -72,14 +72,20 @@ inline constexpr bool kA4ExecutionAvailable = true;
 #endif
 
 // True when an exception is one of the A8/A4 units refusing to run because this build targets an
-// architecture whose kernels were compiled out. On a build where those kernels exist the answer is
-// always false, so such a throw still fails the test.
+// architecture whose kernels were compiled out, or a launcher refusing a schedule the current
+// device's per-block shared-memory ceiling cannot hold (a Turing-compat build on an sm_86/89 part
+// reproduced with NINFER_MAX_DYN_SMEM_BYTES, where the fp8/nvfp4/k8v4 prompt routes do not fit).
+// On a build where those kernels exist and the device is wide enough the answer is always false, so
+// such a throw still fails the test.
 inline bool unsupported_arch_refusal(const std::exception& error) {
     if constexpr (kA8ExecutionAvailable && kA4ExecutionAvailable) {
         (void)error;
         return false;
     } else {
-        return std::string_view(error.what()).find("requires an sm_") != std::string_view::npos;
+        const std::string_view what(error.what());
+        return what.find("requires an sm_") != std::string_view::npos ||
+               what.find("bytes of dynamic shared memory per block; this device grants") !=
+                   std::string_view::npos;
     }
 }
 

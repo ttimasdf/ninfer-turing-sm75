@@ -17,8 +17,8 @@
 #include <cstdlib>
 
 namespace ninfer::ops::detail {
-static_assert(kPromptWaveRows == CausalPromptI8FastShape<8>::Br);
-static_assert(kPromptWaveRows % CausalPromptI8FastShape<4>::Br == 0);
+static_assert(kPromptWaveRows == CausalPromptI8FastShape<8, kCausalPromptI8FastBc>::Br);
+static_assert(kPromptWaveRows % CausalPromptI8FastShape<4, kCausalPromptI8FastBc>::Br == 0);
 static_assert(kPromptWaveRows % kCausalPromptI8Br == 0);
 static_assert(kPromptWaveRows % kCausalPromptBr == 0);
 
@@ -33,6 +33,18 @@ void note_narrow_prompt_tile() {
                      "prompt attention: staging %d-key tiles; this device's shared-memory ceiling "
                      "cannot hold the %d-byte measured tile\n",
                      kCausalPromptBcNarrow, kCausalPromptSmemBytes);
+        return true;
+    }();
+    (void)once;
+}
+
+// The same once-per-process note for the INT8-family route, whose measured tile is 93 KiB.
+void note_narrow_int8_prompt_tile() {
+    static const bool once = [] {
+        std::fprintf(stderr,
+                     "prompt attention: int8 staging %d-key tiles; this device's shared-memory "
+                     "ceiling cannot hold the %d-byte measured tile\n",
+                     kCausalPromptI8BcNarrow, kCausalPromptI8SmemBytes);
         return true;
     }();
     (void)once;
@@ -70,8 +82,8 @@ bool causal_attention_prompt_i8_fast_prefers_narrow(std::int32_t tokens, std::in
         return div_up(div_up(tokens, rows) * q_heads, multiprocessors);
     };
     constexpr int NarrowCostPercent = 72;
-    return waves(CausalPromptI8FastShape<4>::Br) * NarrowCostPercent <
-           waves(CausalPromptI8FastShape<8>::Br) * 100;
+    return waves(CausalPromptI8FastShape<4, kCausalPromptI8FastBc>::Br) * NarrowCostPercent <
+           waves(CausalPromptI8FastShape<8, kCausalPromptI8FastBc>::Br) * 100;
 }
 
 // The int8 cache and rk8v4 share the fast kernel: their keys are the same INT8 G64 codes, and
@@ -82,48 +94,42 @@ void causal_attention_prompt_i8_fast_launch_for(const Tensor& q, const Tensor& p
                                                 float scale, const CacheView& cache,
                                                 Metadata metadata, Tensor& out,
                                                 cudaStream_t stream) {
-    // The int8 family's prompt kernels are sized for a 100 KiB part, and no narrower key-column
-    // tile fits Turing's 64 KiB: refuse with the numbers rather than abort on the launch.
-    require_dynamic_shared_bytes(
-        CausalPromptI8FastShape<8, PackedValues>::SmemBytes,
-        "the fast int8-family prompt-attention kernel (--kv-dtype int8, rk8v4, rk4v4 or rk2v4-e8; "
-        "bf16 serves this device)");
-    require_dynamic_shared_bytes(
-        CausalPromptI8FastShape<4, PackedValues>::SmemBytes,
-        "the fast int8-family prompt-attention kernel (--kv-dtype int8, rk8v4, rk4v4 or rk2v4-e8; "
-        "bf16 serves this device)");
-    configure_cuda_device_once([] {
-        return cudaFuncSetAttribute(
-            causal_attention_prompt_i8_fast_kernel<Geometry, Metadata, 8, PackedValues, Keys>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            CausalPromptI8FastShape<8, PackedValues>::SmemBytes);
-    });
-    configure_cuda_device_once([] {
-        return cudaFuncSetAttribute(
-            causal_attention_prompt_i8_fast_kernel<Geometry, Metadata, 4, PackedValues, Keys>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            CausalPromptI8FastShape<4, PackedValues>::SmemBytes);
-    });
-
+    // The int8 family's prompt kernels are sized for a 100 KiB part. A part whose per-block
+    // ceiling cannot hold the eight-warp 100 KiB tile (Turing grants 64 KiB) stages half as many
+    // key columns per iteration and runs the four-warp shape only, which is the one that fits.
+    const int bc = causal_prompt_i8_fast_bc_for<PackedValues>(max_dynamic_shared_bytes());
     const auto tokens = static_cast<std::int32_t>(q.ne[2]);
-    const auto launch = [&]<int Warps>() {
-        using Shape = CausalPromptI8FastShape<Warps, PackedValues>;
+    const auto launch = [&]<int Warps, int Bc>() {
+        using Shape = CausalPromptI8FastShape<Warps, Bc, PackedValues>;
+        const auto kernel =
+            causal_attention_prompt_i8_fast_kernel<Geometry, Metadata, Warps, Bc, PackedValues,
+                                                   Keys>;
+        require_dynamic_shared_bytes(
+            Shape::SmemBytes,
+            "the fast int8-family prompt-attention kernel (--kv-dtype int8, rk8v4, rk4v4 or "
+            "rk2v4-e8; bf16 serves this device)");
+        configure_cuda_device_once([&] {
+            return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        Shape::SmemBytes);
+        });
         const dim3 grid(static_cast<unsigned>(div_up(tokens, Shape::Br)),
                         static_cast<unsigned>(Geometry::QHeads), 1u);
-        causal_attention_prompt_i8_fast_kernel<Geometry, Metadata, Warps, PackedValues, Keys>
-            <<<grid, Shape::Threads, Shape::SmemBytes, stream>>>(
-                static_cast<const __nv_bfloat16*>(q.data),
-                static_cast<const std::int8_t*>(cache.k_pages.data),
-                static_cast<const std::int8_t*>(cache.v_pages.data),
-                static_cast<const __half*>(cache.k_scale_pages.data),
-                static_cast<const __half*>(cache.v_scale_pages.data), metadata,
-                static_cast<const std::int32_t*>(positions.data), scale,
-                static_cast<__nv_bfloat16*>(out.data), tokens);
+        kernel<<<grid, Shape::Threads, Shape::SmemBytes, stream>>>(
+            static_cast<const __nv_bfloat16*>(q.data),
+            static_cast<const std::int8_t*>(cache.k_pages.data),
+            static_cast<const std::int8_t*>(cache.v_pages.data),
+            static_cast<const __half*>(cache.k_scale_pages.data),
+            static_cast<const __half*>(cache.v_scale_pages.data), metadata,
+            static_cast<const std::int32_t*>(positions.data), scale,
+            static_cast<__nv_bfloat16*>(out.data), tokens);
     };
-    if (causal_attention_prompt_i8_fast_prefers_narrow(tokens, Geometry::QHeads)) {
-        launch.template operator()<4>();
+    if (bc != kCausalPromptI8FastBc) {
+        note_narrow_int8_prompt_tile();
+        launch.template operator()<4, kCausalPromptI8FastBcNarrow>();
+    } else if (causal_attention_prompt_i8_fast_prefers_narrow(tokens, Geometry::QHeads)) {
+        launch.template operator()<4, kCausalPromptI8FastBc>();
     } else {
-        launch.template operator()<8>();
+        launch.template operator()<8, kCausalPromptI8FastBc>();
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -171,35 +177,47 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
         // the plane's storage rather than this kernel's signature, would not be a cleanup. Leave
         // it; the dtype check below is the guard that matters here.
         const bool pack_gqa  = Geometry::GroupSize > 1 && prompt_pack_gqa();
+        // The kernel exceeds the default 48 KiB dynamic-smem ceiling. Its arena is K/V-stage
+        // dominated, so a part whose per-block ceiling cannot hold the measured 93 KiB tile
+        // (Turing grants 64 KiB) stages half as many key columns per iteration: the same kernel
+        // over Bc = 32 instead of 64, exactly as the bf16 route does.
+        const int bc = causal_prompt_i8_bc_for<kCausalPromptI8Br>(max_dynamic_shared_bytes());
         const auto launch_i8 = [&]<bool PackedValues, KvKeyCoding Keys, bool PvF16>() {
             const auto launch = [&]<bool PackGqa>() {
-                const auto kernel =
-                    causal_attention_prompt_i8_kernel<Geometry, Metadata, PackedValues, Keys, PvF16,
-                                                      PackGqa>;
-                // The kernel exceeds the default 48 KiB dynamic-smem ceiling, and the int8 family's
-                // arena is K/V-stage dominated, so it cannot take a narrower tile on Turing.
-                require_dynamic_shared_bytes(
-                    kCausalPromptI8SmemBytes,
-                    "the int8-family prompt-attention kernel (--kv-dtype int8, rk8v4, rk4v4 or "
-                    "rk2v4-e8; bf16 serves this device)");
-                configure_cuda_device_once([&] {
-                    return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                                kCausalPromptI8SmemBytes);
-                });
-                const dim3 grid =
-                    PackGqa ? dim3(static_cast<unsigned>(
-                                       div_up(tokens * Geometry::GroupSize, kCausalPromptI8Br)),
-                                   static_cast<unsigned>(Geometry::KVHeads), 1u)
-                            : dim3(static_cast<unsigned>(div_up(tokens, kCausalPromptI8Br)),
-                                   static_cast<unsigned>(Geometry::QHeads), 1u);
-                kernel<<<grid, kCausalPromptI8Threads, kCausalPromptI8SmemBytes, stream>>>(
-                    static_cast<const __nv_bfloat16*>(q.data),
-                    static_cast<const std::int8_t*>(cache_k.data),
-                    static_cast<const std::int8_t*>(cache_v.data),
-                    static_cast<const __half*>(cache.k_scale_pages.data),
-                    static_cast<const __half*>(cache.v_scale_pages.data), metadata,
-                    static_cast<const std::int32_t*>(positions.data), scale,
-                    static_cast<__nv_bfloat16*>(out.data), tokens);
+                const auto launch_tile = [&]<int Bc>() {
+                    const auto kernel = causal_attention_prompt_i8_kernel<Geometry, Metadata, Bc,
+                                                                           PackedValues, Keys, PvF16,
+                                                                           PackGqa>;
+                    constexpr int kSmem = causal_prompt_i8_smem_bytes<kCausalPromptI8Br, Bc>();
+                    require_dynamic_shared_bytes(
+                        kSmem,
+                        "the int8-family prompt-attention kernel (--kv-dtype int8, rk8v4, rk4v4 or "
+                        "rk2v4-e8; bf16 serves this device)");
+                    configure_cuda_device_once([&] {
+                        return cudaFuncSetAttribute(
+                            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem);
+                    });
+                    const dim3 grid =
+                        PackGqa ? dim3(static_cast<unsigned>(
+                                           div_up(tokens * Geometry::GroupSize, kCausalPromptI8Br)),
+                                       static_cast<unsigned>(Geometry::KVHeads), 1u)
+                                : dim3(static_cast<unsigned>(div_up(tokens, kCausalPromptI8Br)),
+                                       static_cast<unsigned>(Geometry::QHeads), 1u);
+                    kernel<<<grid, kCausalPromptI8Threads, kSmem, stream>>>(
+                        static_cast<const __nv_bfloat16*>(q.data),
+                        static_cast<const std::int8_t*>(cache_k.data),
+                        static_cast<const std::int8_t*>(cache_v.data),
+                        static_cast<const __half*>(cache.k_scale_pages.data),
+                        static_cast<const __half*>(cache.v_scale_pages.data), metadata,
+                        static_cast<const std::int32_t*>(positions.data), scale,
+                        static_cast<__nv_bfloat16*>(out.data), tokens);
+                };
+                if (bc == kCausalPromptI8Bc) {
+                    launch_tile.template operator()<kCausalPromptI8Bc>();
+                } else {
+                    note_narrow_int8_prompt_tile();
+                    launch_tile.template operator()<kCausalPromptI8BcNarrow>();
+                }
             };
             if (pack_gqa) {
                 launch.template operator()<true>();

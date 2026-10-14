@@ -89,37 +89,60 @@ inline constexpr int kCausalPromptI8Threads    = kCausalPromptI8Warps * 32;
 inline constexpr int kCausalPromptI8Br         = 64;
 inline constexpr int kCausalPromptI8Bc         = 64;
 inline constexpr int kCausalPromptI8Groups     = kCausalPromptHeadDim / kKVCacheInt8Group;
+inline constexpr int kCausalPromptI8VGroups    = kCausalPromptHeadDim / kKVCacheInt4ValueGroup;
 inline constexpr int kCausalPromptI8DB16       = kCausalPromptHeadDim / 2;
 inline constexpr int kCausalPromptI8RowTiles   = kCausalPromptI8Br / 16;
 inline constexpr int kCausalPromptI8DConsumers = kCausalPromptI8Warps / kCausalPromptI8RowTiles;
 
-inline constexpr int kCausalPromptI8QBytes = kCausalPromptI8Br * kCausalPromptHeadDim;
-inline constexpr int kCausalPromptI8QScaleBytes =
-    kCausalPromptI8Br * kCausalPromptI8Groups * static_cast<int>(sizeof(float));
-inline constexpr int kCausalPromptI8KBytes = kCausalPromptI8Bc * kCausalPromptHeadDim;
-inline constexpr int kCausalPromptI8VBytes = kCausalPromptI8Bc * kCausalPromptHeadDim;
-inline constexpr int kCausalPromptI8VStageBytes =
-    kCausalPromptI8Bc * kCausalPromptHeadDim * static_cast<int>(sizeof(__half));
-inline constexpr int kCausalPromptI8PBytes =
-    kCausalPromptI8Br * kCausalPromptI8Bc * static_cast<int>(sizeof(__half));
-inline constexpr int kCausalPromptI8VGroups =
-    kCausalPromptHeadDim / kKVCacheInt4ValueGroup;
-// Key scale rows plus value scale rows. Value rows are always the wider packed-int4 stride so
-// both codings share one arena layout; INT8 uses the leading kCausalPromptI8Groups entries. The
-//512 extra bytes do not change occupancy, which is one CTA per SM either way.
-inline constexpr int kCausalPromptI8ScaleBytes =
-    kCausalPromptI8Bc * (kCausalPromptI8Groups + kCausalPromptI8VGroups) *
-    static_cast<int>(sizeof(__half));
-inline constexpr int kCausalPromptI8StatsBytes =
-    2 * kCausalPromptI8Br * static_cast<int>(sizeof(float));
+// The dynamic shared memory one prompt tile stages. Q and its scales follow the row block Br; the
+// K/V tiles, the f16 value stage, the probability tile and the K/V scale rows all follow the
+// key-column tile Bc. The kernel was measured with the 93 KiB Bc = 64 tile, so a part whose
+// per-block ceiling is below that (Turing grants 64 KiB) stages half as many key columns per
+// iteration instead.
+template <int Br, int Bc>
+struct CausalPromptI8Arena {
+    static constexpr int QBytes = Br * kCausalPromptHeadDim;
+    static constexpr int QScaleBytes =
+        Br * kCausalPromptI8Groups * static_cast<int>(sizeof(float));
+    static constexpr int KBytes = Bc * kCausalPromptHeadDim;
+    static constexpr int VBytes = Bc * kCausalPromptHeadDim;
+    static constexpr int VStageBytes =
+        Bc * kCausalPromptHeadDim * static_cast<int>(sizeof(__half));
+    static constexpr int PBytes = Br * Bc * static_cast<int>(sizeof(__half));
+    // Key scale rows plus value scale rows. Value rows are always the wider packed-int4 stride so
+    // both codings share one arena layout; INT8 uses the leading kCausalPromptI8Groups entries.
+    // The extra bytes do not change occupancy, which is one CTA per SM either way.
+    static constexpr int ScaleBytes =
+        Bc * (kCausalPromptI8Groups + kCausalPromptI8VGroups) * static_cast<int>(sizeof(__half));
+    static constexpr int StatsBytes = 2 * Br * static_cast<int>(sizeof(float));
+    static constexpr int Bytes = QBytes + QScaleBytes + KBytes + VBytes + VStageBytes + PBytes +
+                                 ScaleBytes + StatsBytes;
+};
+
+template <int Br, int Bc>
+inline constexpr int causal_prompt_i8_smem_bytes() {
+    return CausalPromptI8Arena<Br, Bc>::Bytes;
+}
+
 inline constexpr int kCausalPromptI8SmemBytes =
-    kCausalPromptI8QBytes + kCausalPromptI8QScaleBytes + kCausalPromptI8KBytes +
-    kCausalPromptI8VBytes + kCausalPromptI8VStageBytes + kCausalPromptI8PBytes +
-    kCausalPromptI8ScaleBytes + kCausalPromptI8StatsBytes;
+    causal_prompt_i8_smem_bytes<kCausalPromptI8Br, kCausalPromptI8Bc>();
+
+// The narrow key-column tile, and the one this device admits. Both are the same kernel.
+inline constexpr int kCausalPromptI8BcNarrow = 32;
+
+template <int Br>
+inline constexpr int causal_prompt_i8_bc_for(int max_dynamic_shared_bytes) {
+    return max_dynamic_shared_bytes >= causal_prompt_i8_smem_bytes<Br, kCausalPromptI8Bc>()
+               ? kCausalPromptI8Bc
+               : kCausalPromptI8BcNarrow;
+}
 
 static_assert(kCausalPromptI8Groups == 4);
+static_assert(kCausalPromptI8VGroups == 8);
 static_assert(kCausalPromptI8DConsumers == 4);
 static_assert(kCausalPromptI8SmemBytes == 93184);
+static_assert(causal_prompt_i8_smem_bytes<kCausalPromptI8Br, kCausalPromptI8BcNarrow>() <=
+              65536);
 
 // The f16 value loaders this kernel needs now live in ops/kv_cache/int8_g64_codec.cuh, beside their
 // bf16 counterparts: kv_cache_int8_dequant_f16x8_from and kv_cache_int4_dequant_f16x8_from. They
@@ -148,7 +171,7 @@ static_assert(kCausalPromptI8SmemBytes == 93184);
 // GroupSize + head within the group), so a CTA stages every K/V tile once for the whole group
 // instead of once per query head; the grid runs over packed row blocks and KV heads. Everything
 // past the row mapping -- quantization, both MMAs, the online softmax -- is unchanged.
-template <typename Geometry, typename Metadata, bool PackedValues = false,
+template <typename Geometry, typename Metadata, int Bc, bool PackedValues = false,
           KvKeyCoding Keys = KvKeyCoding::Int8, bool PvF16 = false, bool PackGqa = false>
 __global__ __maxnreg__(NINFER_PROMPT_I8_MAXNREG) void causal_attention_prompt_i8_kernel(
     const __nv_bfloat16* __restrict__ q, const std::int8_t* __restrict__ cache_k,
@@ -159,10 +182,12 @@ __global__ __maxnreg__(NINFER_PROMPT_I8_MAXNREG) void causal_attention_prompt_i8
     constexpr bool PackedKeys   = Keys != KvKeyCoding::Int8;
     constexpr int D             = kCausalPromptHeadDim;
     constexpr int Br            = kCausalPromptI8Br;
-    constexpr int Bc            = kCausalPromptI8Bc;
     constexpr int DB16          = kCausalPromptI8DB16;
     constexpr int Groups        = kCausalPromptI8Groups;
+    constexpr int VGroups       = kCausalPromptI8VGroups;
     constexpr int GroupKc       = kKVCacheInt8Group / 32;
+    using Arena                 = CausalPromptI8Arena<Br, Bc>;
+    static_assert(Bc == kCausalPromptI8Bc || Bc == kCausalPromptI8BcNarrow);
     constexpr int QKNt          = Bc / 8;
     constexpr int PVNtPerWarp   = D / (kCausalPromptI8DConsumers * 8);
     constexpr int PVKs          = Bc / 16;
@@ -177,18 +202,17 @@ __global__ __maxnreg__(NINFER_PROMPT_I8_MAXNREG) void causal_attention_prompt_i8
 
     extern __shared__ __align__(16) unsigned char smem_raw[];
     std::int8_t* q_i8 = reinterpret_cast<std::int8_t*>(smem_raw);
-    float* q_scale    = reinterpret_cast<float*>(q_i8 + kCausalPromptI8QBytes);
+    float* q_scale    = reinterpret_cast<float*>(q_i8 + Arena::QBytes);
     std::int8_t* k_i8 = reinterpret_cast<std::int8_t*>(reinterpret_cast<unsigned char*>(q_scale) +
-                                                       kCausalPromptI8QScaleBytes);
-    std::int8_t* v_i8 = k_i8 + kCausalPromptI8KBytes;
-    __half* v_f16     = reinterpret_cast<__half*>(v_i8 + kCausalPromptI8VBytes);
+                                                       Arena::QScaleBytes);
+    std::int8_t* v_i8 = k_i8 + Arena::KBytes;
+    __half* v_f16     = reinterpret_cast<__half*>(v_i8 + Arena::VBytes);
     __half* p_s       = reinterpret_cast<__half*>(reinterpret_cast<unsigned char*>(v_f16) +
-                                                  kCausalPromptI8VStageBytes);
+                                                  Arena::VStageBytes);
     __half* k_scale_s =
-        reinterpret_cast<__half*>(reinterpret_cast<unsigned char*>(p_s) + kCausalPromptI8PBytes);
-    __half* v_scale_s    = k_scale_s + Bc * Groups;
-    constexpr int VGroups = kCausalPromptI8VGroups;
-    float* alpha_s       = reinterpret_cast<float*>(v_scale_s + Bc * VGroups);
+        reinterpret_cast<__half*>(reinterpret_cast<unsigned char*>(p_s) + Arena::PBytes);
+    __half* v_scale_s = k_scale_s + Bc * Groups;
+    float* alpha_s    = reinterpret_cast<float*>(v_scale_s + Bc * VGroups);
     float* final_l_s     = alpha_s + Br;
     __nv_bfloat16* q_b16 = reinterpret_cast<__nv_bfloat16*>(q_i8);
     __nv_bfloat16* k_b16 = reinterpret_cast<__nv_bfloat16*>(k_i8);
@@ -295,15 +319,19 @@ __global__ __maxnreg__(NINFER_PROMPT_I8_MAXNREG) void causal_attention_prompt_i8
         const int physical_page = block_table[tile_k0 >> kPagedKVPageShift];
         for (int key_l = tid; key_l < Bc; key_l += kCausalPromptI8Threads) {
             const int key = tile_k0 + key_l;
+            // A key-column tile narrower than a page (Bc = 32 against kPagedKVPageSize = 64)
+            // shares its page with its neighbour, so the cache offset is the tile's first key
+            // inside the page, not the tile-local index.
+            const int page_off = (tile_k0 & kPagedKVPageMask) + key_l;
             __half* kd    = &k_scale_s[key_l * Groups];
             __half* vd    = &v_scale_s[key_l * VGroups];
             if (FullTile || key <= max_query_abs) {
-                const std::int64_t off =
-                    kv_cache_int8_quant_scale_index<Geometry>(physical_page, kv_head, 0, key_l);
+                const std::int64_t off = kv_cache_int8_quant_scale_index<Geometry>(
+                    physical_page, kv_head, 0, page_off);
                 ninfer::ops::cp_async<8>(kd, &cache_k_scale[off]);
                 if constexpr (PackedValues) {
                     const std::int64_t voff = kv_cache_int4_value_scale_index<Geometry>(
-                        physical_page, kv_head, 0, key_l);
+                        physical_page, kv_head, 0, page_off);
                     ninfer::ops::cp_async<16>(vd, &cache_v_scale[voff]);
                 } else {
                     ninfer::ops::cp_async<8>(vd, &cache_v_scale[off]);
@@ -326,14 +354,15 @@ __global__ __maxnreg__(NINFER_PROMPT_I8_MAXNREG) void causal_attention_prompt_i8
                     const int key_l = chunk / (D / 16);
                     const int dc    = chunk - key_l * (D / 16);
                     const int d     = dc * 16;
-                    const int key   = tile_k0 + key_l;
-                    k_packed[i]     = KeyChunk{};
+                    const int key      = tile_k0 + key_l;
+                    const int page_off = (tile_k0 & kPagedKVPageMask) + key_l;
+                    k_packed[i]        = KeyChunk{};
                     if (FullTile || key <= max_query_abs) {
                         const std::int64_t key_off =
                             kv_cache_packed_key_chunk_index<Geometry, Keys>(physical_page, kv_head,
-                                                                            d, key_l);
+                                                                            d, page_off);
                         const std::int64_t value_off = kv_cache_int4_value_code_index<Geometry>(
-                            physical_page, kv_head, d >> 1, key_l);
+                            physical_page, kv_head, d >> 1, page_off);
                         k_packed[i] = *reinterpret_cast<const KeyChunk*>(
                             reinterpret_cast<const std::uint8_t*>(cache_k) + key_off);
                         ninfer::ops::cp_async<8>(
@@ -350,16 +379,17 @@ __global__ __maxnreg__(NINFER_PROMPT_I8_MAXNREG) void causal_attention_prompt_i8
                 const int key_l = chunk / (D / 16);
                 const int dc    = chunk - key_l * (D / 16);
                 const int d     = dc * 16;
-                const int key   = tile_k0 + key_l;
+                const int key      = tile_k0 + key_l;
+                const int page_off = (tile_k0 & kPagedKVPageMask) + key_l;
                 std::int8_t* kd = &k_i8[(key_l * DB16 + causal_prompt_swz(key_l, dc * 8)) * 2];
                 if (FullTile || key <= max_query_abs) {
-                    const std::int64_t off =
-                        kv_cache_int8_quant_code_index<Geometry>(physical_page, kv_head, d, key_l);
+                    const std::int64_t off = kv_cache_int8_quant_code_index<Geometry>(
+                        physical_page, kv_head, d, page_off);
                     cp_async<16, Cache::cg>(kd, &cache_k[off]);
                     if constexpr (PackedValues) {
                         // Sixteen dimensions occupy eight packed bytes.
                         const std::int64_t voff = kv_cache_int4_value_code_index<Geometry>(
-                            physical_page, kv_head, d >> 1, key_l);
+                            physical_page, kv_head, d >> 1, page_off);
                         // cp.async.cg is 16-byte only; the 8-byte form uses the default policy.
                         ninfer::ops::cp_async<8>(
                             &v_i8[key_l * D + (d >> 1)],
