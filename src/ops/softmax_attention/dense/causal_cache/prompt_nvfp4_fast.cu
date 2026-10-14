@@ -43,6 +43,10 @@ void launch_fast_for(const Tensor& q, const Tensor& positions, const Tensor* val
             using Shape = CausalPromptRotatedShape<Warps>;
             constexpr auto kernel =
                 causal_attention_prompt_rotated_fast_kernel<G, Metadata, Warps, Split>;
+            require_dynamic_shared_bytes(
+                Shape::SmemBytes,
+                "the fast prompt-attention kernel for rotated/nvfp4 caches (--kv-dtype nvfp4, "
+                "rk2v4-e8 or rk4v4-e8)");
             configure_cuda_device_once([&] {
                 return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                             Shape::SmemBytes);

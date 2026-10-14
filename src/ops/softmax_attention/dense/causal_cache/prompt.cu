@@ -13,6 +13,7 @@
 #include "core/device.h" // CUDA_CHECK
 
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 
 namespace ninfer::ops::detail {
@@ -22,6 +23,20 @@ static_assert(kPromptWaveRows % kCausalPromptI8Br == 0);
 static_assert(kPromptWaveRows % kCausalPromptBr == 0);
 
 namespace {
+
+// Says once, when a device's shared-memory ceiling forces the narrow prompt tile, why the prompt
+// route is running the narrow one: the cost is invisible otherwise, and it is the difference
+// between the 96 KiB tile this kernel was measured with and what the part grants.
+void note_narrow_prompt_tile() {
+    static const bool once = [] {
+        std::fprintf(stderr,
+                     "prompt attention: staging %d-key tiles; this device's shared-memory ceiling "
+                     "cannot hold the %d-byte measured tile\n",
+                     kCausalPromptBcNarrow, kCausalPromptSmemBytes);
+        return true;
+    }();
+    (void)once;
+}
 
 // Sums each key tile's PV products in FP16 on the packed-value INT8 prompt kernels where the
 // device profile's "attn_pv_f16" says "on"; NINFER_PROMPT_PV_F16=0|1 overrides the profile.
@@ -67,6 +82,16 @@ void causal_attention_prompt_i8_fast_launch_for(const Tensor& q, const Tensor& p
                                                 float scale, const CacheView& cache,
                                                 Metadata metadata, Tensor& out,
                                                 cudaStream_t stream) {
+    // The int8 family's prompt kernels are sized for a 100 KiB part, and no narrower key-column
+    // tile fits Turing's 64 KiB: refuse with the numbers rather than abort on the launch.
+    require_dynamic_shared_bytes(
+        CausalPromptI8FastShape<8, PackedValues>::SmemBytes,
+        "the fast int8-family prompt-attention kernel (--kv-dtype int8, rk8v4, rk4v4 or rk2v4-e8; "
+        "bf16 serves this device)");
+    require_dynamic_shared_bytes(
+        CausalPromptI8FastShape<4, PackedValues>::SmemBytes,
+        "the fast int8-family prompt-attention kernel (--kv-dtype int8, rk8v4, rk4v4 or rk2v4-e8; "
+        "bf16 serves this device)");
     configure_cuda_device_once([] {
         return cudaFuncSetAttribute(
             causal_attention_prompt_i8_fast_kernel<Geometry, Metadata, 8, PackedValues, Keys>,
@@ -151,7 +176,12 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
                 const auto kernel =
                     causal_attention_prompt_i8_kernel<Geometry, Metadata, PackedValues, Keys, PvF16,
                                                       PackGqa>;
-                // The kernel exceeds the default 48 KiB dynamic-smem ceiling.
+                // The kernel exceeds the default 48 KiB dynamic-smem ceiling, and the int8 family's
+                // arena is K/V-stage dominated, so it cannot take a narrower tile on Turing.
+                require_dynamic_shared_bytes(
+                    kCausalPromptI8SmemBytes,
+                    "the int8-family prompt-attention kernel (--kv-dtype int8, rk8v4, rk4v4 or "
+                    "rk2v4-e8; bf16 serves this device)");
                 configure_cuda_device_once([&] {
                     return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                                 kCausalPromptI8SmemBytes);
@@ -198,21 +228,32 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
             launch_i8.template operator()<false, KvKeyCoding::Int8, false>();
         }
     } else {
-        // The kernel exceeds the default 48 KiB dynamic-smem ceiling.
-        configure_cuda_device_once([&] {
-            return cudaFuncSetAttribute(causal_attention_prompt_bf16_kernel<Geometry, Metadata>,
-                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        kCausalPromptSmemBytes);
-        });
+        // The kernel exceeds the default 48 KiB dynamic-smem ceiling. A part whose per-block ceiling
+        // cannot hold the measured 96 KiB tile (Turing grants 64 KiB) stages the narrow key-column
+        // tile instead: the same kernel over half as many keys per iteration.
+        const int bc = causal_prompt_bc_for<kCausalPromptBr>(max_dynamic_shared_bytes());
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kCausalPromptBr)),
                                   static_cast<unsigned>(Geometry::QHeads), 1u);
-        causal_attention_prompt_bf16_kernel<Geometry, Metadata>
-            <<<attention_grid, kCausalPromptThreads, kCausalPromptSmemBytes, stream>>>(
-                static_cast<const __nv_bfloat16*>(q.data),
-                static_cast<const __nv_bfloat16*>(cache_k.data),
-                static_cast<const __nv_bfloat16*>(cache_v.data), metadata,
-                static_cast<const std::int32_t*>(positions.data), scale,
-                static_cast<__nv_bfloat16*>(out.data), tokens);
+        const auto launch = [&]<int Bc>() {
+            constexpr int kSmem = causal_prompt_smem_bytes<kCausalPromptBr, Bc>();
+            configure_cuda_device_once([&] {
+                return cudaFuncSetAttribute(causal_attention_prompt_bf16_kernel<Geometry, Metadata, Bc>,
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem);
+            });
+            causal_attention_prompt_bf16_kernel<Geometry, Metadata, Bc>
+                <<<attention_grid, kCausalPromptThreads, kSmem, stream>>>(
+                    static_cast<const __nv_bfloat16*>(q.data),
+                    static_cast<const __nv_bfloat16*>(cache_k.data),
+                    static_cast<const __nv_bfloat16*>(cache_v.data), metadata,
+                    static_cast<const std::int32_t*>(positions.data), scale,
+                    static_cast<__nv_bfloat16*>(out.data), tokens);
+        };
+        if (bc == kCausalPromptBc) {
+            launch.template operator()<kCausalPromptBc>();
+        } else {
+            note_narrow_prompt_tile();
+            launch.template operator()<kCausalPromptBcNarrow>();
+        }
     }
     CUDA_CHECK(cudaGetLastError());
 }

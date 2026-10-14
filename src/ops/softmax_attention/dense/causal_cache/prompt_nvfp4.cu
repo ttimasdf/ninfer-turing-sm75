@@ -17,6 +17,7 @@ void causal_attention_prompt_nvfp4_attention_launch_for(const Tensor& q, const T
                                                         float scale, const CacheView& cache,
                                                         Metadata metadata, Tensor& out,
                                                         cudaStream_t stream) {
+    require_dynamic_shared_bytes(kCausalPromptNvfp4SmemBytes, "the prompt-attention kernel for nvfp4 caches (--kv-dtype nvfp4)");
     configure_cuda_device_once([&] {
         return cudaFuncSetAttribute(
             causal_attention_prompt_nvfp4_kernel<Geometry, Metadata>,

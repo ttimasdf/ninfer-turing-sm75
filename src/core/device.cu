@@ -69,6 +69,32 @@ void cuda_check(cudaError_t err, const char* expr, const char* file, int line) {
     std::abort();
 }
 
+int max_dynamic_shared_bytes() {
+    if (const char* value = std::getenv("NINFER_MAX_DYN_SMEM_BYTES")) {
+        const long parsed = std::strtol(value, nullptr, 10);
+        if (parsed > 0) { return static_cast<int>(parsed); }
+    }
+    static std::mutex mutex;
+    static std::unordered_map<int, int> cache;
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    const std::scoped_lock lock(mutex);
+    const auto found = cache.find(device);
+    if (found != cache.end()) { return found->second; }
+    int bytes = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&bytes, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+    cache.emplace(device, bytes);
+    return bytes;
+}
+
+void require_dynamic_shared_bytes(int bytes, const char* what) {
+    const int ceiling = max_dynamic_shared_bytes();
+    if (bytes <= ceiling) { return; }
+    throw std::runtime_error(std::string(what) + " needs " + std::to_string(bytes) +
+                             " bytes of dynamic shared memory per block; this device grants " +
+                             std::to_string(ceiling));
+}
+
 int memory_device(const void* pointer) {
     if (pointer == nullptr) { return -1; }
     cudaPointerAttributes attributes{};

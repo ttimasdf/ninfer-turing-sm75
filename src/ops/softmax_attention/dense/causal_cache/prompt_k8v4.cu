@@ -17,6 +17,7 @@ void causal_attention_prompt_k8v4_attention_launch_for(const Tensor& q, const Te
                                                        float scale, const CacheView& cache,
                                                        Metadata metadata, Tensor& out,
                                                        cudaStream_t stream) {
+    require_dynamic_shared_bytes(kCausalPromptK8V4SmemBytes, "the prompt-attention kernel for fp8-key/nvfp4-value caches (--kv-dtype k8v4)");
     configure_cuda_device_once([&] {
         return cudaFuncSetAttribute(
             causal_attention_prompt_k8v4_kernel<Geometry, Metadata>,

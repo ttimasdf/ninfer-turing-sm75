@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -18,6 +19,19 @@
 namespace ninfer {
 
 void cuda_check(cudaError_t err, const char* expr, const char* file, int line);
+
+// The largest dynamic shared-memory reservation this device grants per block. Launchers size their
+// arenas for the parts their schedules were measured on, so a narrower device has to be asked
+// rather than assumed: Turing (sm_75) grants 64 KiB against sm_86/89's 100 KiB. Cached per device,
+// and overridable through NINFER_MAX_DYN_SMEM_BYTES so a narrow part's ceiling can be reproduced on
+// a wider one.
+int max_dynamic_shared_bytes();
+
+// Refuses a per-kernel dynamic shared-memory request this device cannot grant. A launcher whose
+// schedule is sized for a wider part calls this before cudaFuncSetAttribute, so a caller gets a
+// precise error instead of the process aborting on an unattributed cudaErrorInvalidValue. Throws
+// std::runtime_error; `what` names the route and, where there is one, the alternative to use.
+void require_dynamic_shared_bytes(int bytes, const char* what);
 
 #define CUDA_CHECK(expr) ::ninfer::cuda_check((expr), #expr, __FILE__, __LINE__)
 
@@ -52,6 +66,14 @@ void configure_cuda_device_once(Configure&& configure) {
             result = std::forward<Configure>(configure)();
             results.emplace(device, result);
         }
+    }
+    if (result != cudaSuccess) {
+        // The configure step is a per-kernel cudaFuncSetAttribute, so say which attribute class
+        // failed and the ceiling that most often rejects one.
+        std::fprintf(stderr,
+                     "configure_cuda_device_once: a per-kernel attribute was rejected (%s) on "
+                     "device %d, whose opt-in dynamic shared-memory ceiling is %d bytes\n",
+                     cudaGetErrorName(result), device, max_dynamic_shared_bytes());
     }
     CUDA_CHECK(result);
 }

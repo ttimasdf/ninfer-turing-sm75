@@ -25,12 +25,11 @@ namespace ninfer::ops {
 // swizzled smem buffer. Keys beyond max_query_abs (which the causal mask always
 // drops) are zeroed so the padded/uninitialized cache tail never feeds NaNs into
 // the tensor cores. Mirrors FA's predicated K/V cp.async + Clear_OOB path.
-template <typename Geometry>
+template <typename Geometry, int Bc = kCausalPromptBc>
 __device__ __forceinline__ void
 causal_prompt_stage_kv(__nv_bfloat16* dst, const __nv_bfloat16* cache, int kv_head, int k0,
                        int max_query_abs, int physical_page, int tid) {
     constexpr int D         = kCausalPromptHeadDim;
-    constexpr int Bc        = kCausalPromptBc;
     constexpr int Threads   = kCausalPromptThreads;
     constexpr int VecPerRow = D / 8; // 8 bf16 per 16B cp.async
     const bool full_tile    = (k0 + Bc - 1) <= max_query_abs;
@@ -64,7 +63,7 @@ causal_prompt_stage_kv(__nv_bfloat16* dst, const __nv_bfloat16* cache, int kv_he
 // FlashAttention-2 forward, one CTA per (query 64-row block, query head). Grid is
 // (ceil(tokens/64), q_heads). seqlen_q = tokens, seqlen_k = base_pos + tokens, with
 // bottom-right causal alignment (query row i sees keys [0, base_pos + i]).
-template <typename Geometry, typename Metadata>
+template <typename Geometry, typename Metadata, int Bc = kCausalPromptBc>
 __launch_bounds__(kCausalPromptThreads, 1) __global__
     void causal_attention_prompt_bf16_kernel(const __nv_bfloat16* __restrict__ q,
                                              const __nv_bfloat16* __restrict__ cache_k,
@@ -74,8 +73,7 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
                                              float scale, __nv_bfloat16* __restrict__ out,
                                              std::int32_t width) {
     constexpr int D             = kCausalPromptHeadDim; // 256
-    constexpr int Br            = kCausalPromptBr;      // 64 query rows
-    constexpr int Bc            = kCausalPromptBc;      // 64 key cols
+    constexpr int Br            = kCausalPromptBr;      // 64 query rows, one 16-row tile per warp
     constexpr int Threads       = kCausalPromptThreads; // 128
     constexpr int QKNt          = Bc / 8;               // 8  QK score n-tiles
     constexpr int QKKs          = D / 16;               // 16 QK contraction steps over head_dim
@@ -189,19 +187,24 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
 
     // Prologue: commit Q, then kick off K(0). The loop's wait<0> below drains both.
     ninfer::ops::cp_commit();
-    causal_prompt_stage_kv<Geometry>(k_s, cache_k, kv_head, 0, max_query_abs, physical_page, tid);
+    causal_prompt_stage_kv<Geometry, Bc>(k_s, cache_k, kv_head, 0, max_query_abs, physical_page, tid);
     ninfer::ops::cp_commit();
 
     for (int kb = 0; kb < n_block_max; ++kb) {
         const int k0                 = kb * Bc;
-        const int next_physical_page = (kb + 1 < n_block_max) ? block_table[kb + 1] : physical_page;
+        // The next tile's page. A tile narrower than a page (a narrow part stages Bc = 32 key
+        // columns against kPagedKVPageSize = 64) shares its page with its neighbour, so take the
+        // entry that holds the tile's first key rather than assuming one page per tile.
+        const int next_physical_page =
+            (kb + 1 < n_block_max) ? block_table[((kb + 1) * Bc) >> kPagedKVPageShift]
+                                   : physical_page;
 
         ninfer::ops::cp_wait<0>(); // K(kb) landed (also publishes q_s / prev PV done)
         __syncthreads();
 
         // Overlap V(kb) load against the QK MMA below.
-        causal_prompt_stage_kv<Geometry>(v_s, cache_v, kv_head, k0, max_query_abs, physical_page,
-                                         tid);
+        causal_prompt_stage_kv<Geometry, Bc>(v_s, cache_v, kv_head, k0, max_query_abs, physical_page,
+                                             tid);
         ninfer::ops::cp_commit();
 
         // S = Q Kᵀ for this warp's 16 rows over all Bc keys, in registers.
@@ -356,8 +359,8 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
         // Prefetch K(kb+1) into the (now-free) K buffer, overlapping the PV MMA.
         if (kb + 1 < n_block_max) {
             physical_page = next_physical_page;
-            causal_prompt_stage_kv<Geometry>(k_s, cache_k, kv_head, (kb + 1) * Bc, max_query_abs,
-                                             physical_page, tid);
+            causal_prompt_stage_kv<Geometry, Bc>(k_s, cache_k, kv_head, (kb + 1) * Bc, max_query_abs,
+                                                 physical_page, tid);
             ninfer::ops::cp_commit();
         }
 

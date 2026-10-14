@@ -21,9 +21,28 @@ inline constexpr int kCausalPromptHeadDim = 256;
 inline constexpr int kCausalPromptBr        = 64;
 inline constexpr int kCausalPromptBc        = 64;
 inline constexpr int kCausalPromptThreads   = 128;
-inline constexpr int kCausalPromptSmemBytes = (kCausalPromptBr + 2 * kCausalPromptBc) *
-                                              kCausalPromptHeadDim *
-                                              static_cast<int>(sizeof(__nv_bfloat16));
+
+// The dynamic shared memory one prompt tile stages: Br query rows plus a K and a V tile of Bc key
+// columns. The BF16 kernel takes Bc as a parameter, so a part whose per-block ceiling is below the
+// 96 KiB this tile was measured with (Turing grants 64 KiB, sm_86/89 grant 100 KiB) can stage half
+// as many keys per iteration instead.
+template <int Br, int Bc>
+inline constexpr int causal_prompt_smem_bytes() {
+    return (Br + 2 * Bc) * kCausalPromptHeadDim * static_cast<int>(sizeof(__nv_bfloat16));
+}
+
+inline constexpr int kCausalPromptSmemBytes =
+    causal_prompt_smem_bytes<kCausalPromptBr, kCausalPromptBc>();
+
+// The narrow key-column tile, and the one this device admits. Both are the same kernel.
+inline constexpr int kCausalPromptBcNarrow = 32;
+
+template <int Br>
+inline constexpr int causal_prompt_bc_for(int max_dynamic_shared_bytes) {
+    return max_dynamic_shared_bytes >= causal_prompt_smem_bytes<Br, kCausalPromptBc>()
+               ? kCausalPromptBc
+               : kCausalPromptBcNarrow;
+}
 
 template <typename Geometry>
 __device__ __forceinline__ std::int64_t causal_prompt_q_index(int q_head, int d, int token) {
