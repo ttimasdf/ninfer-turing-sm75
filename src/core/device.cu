@@ -123,24 +123,44 @@ std::string kernel_entry_name(const void* entry) {
     return name;
 }
 
-[[noreturn]] void throw_dynamic_shared_bytes(const void* kernel, int bytes, int ceiling) {
+// The kernel's static shared memory size, or 0 when the runtime cannot describe the symbol (the
+// attribute call then decides and names the kernel if it fails). cudaFuncSetAttribute accepts a
+// dynamic request only when dynamic + static fit the opt-in ceiling, so a 64 KiB part cannot hold a
+// kernel whose arena is exactly 64 KiB if that kernel also declares any static shared array -- the
+// reason causal_attention_small_t_i8_tiled_kernel's 64-key arena is rejected on a T4.
+std::size_t kernel_static_shared_bytes(const void* kernel) {
+    if (kernel == nullptr) { return 0; }
+    cudaFuncAttributes attributes{};
+    if (::cudaFuncGetAttributes(&attributes, kernel) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    return attributes.sharedSizeBytes;
+}
+
+[[noreturn]] void throw_dynamic_shared_bytes(const void* kernel, int bytes,
+                                             std::size_t static_bytes, int ceiling) {
     const std::string name = kernel_entry_name(kernel);
     int device = 0;
     (void)cudaGetDevice(&device);
     std::fprintf(stderr,
-                 "kernel %s needs %d bytes of dynamic shared memory per block; device %d grants "
-                 "%d\n",
-                 name.c_str(), bytes, device, ceiling);
+                 "kernel %s needs %d bytes of dynamic shared memory per block (plus %zu static); "
+                 "device %d grants %d\n",
+                 name.c_str(), bytes, static_bytes, device, ceiling);
     throw std::runtime_error("kernel " + name + " needs " + std::to_string(bytes) +
-                             " bytes of dynamic shared memory per block; this device grants " +
+                             " bytes of dynamic shared memory per block (plus " +
+                             std::to_string(static_bytes) + " static); this device grants " +
                              std::to_string(ceiling));
 }
 
 } // namespace
 
 cudaError_t set_max_dynamic_shared_memory(const void* kernel, int bytes) {
-    const int ceiling = max_dynamic_shared_bytes();
-    if (bytes > ceiling) { throw_dynamic_shared_bytes(kernel, bytes, ceiling); }
+    const int ceiling      = max_dynamic_shared_bytes();
+    const std::size_t stat = kernel_static_shared_bytes(kernel);
+    if (static_cast<std::int64_t>(bytes) + static_cast<std::int64_t>(stat) > ceiling) {
+        throw_dynamic_shared_bytes(kernel, bytes, stat, ceiling);
+    }
     const cudaError_t result = ::cudaFuncSetAttribute(
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
     if (result != cudaSuccess) {

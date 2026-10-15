@@ -84,8 +84,7 @@ inline bool unsupported_arch_refusal(const std::exception& error) {
     } else {
         const std::string_view what(error.what());
         return what.find("requires an sm_") != std::string_view::npos ||
-               what.find("bytes of dynamic shared memory per block; this device grants") !=
-                   std::string_view::npos;
+               what.find("bytes of dynamic shared memory per block") != std::string_view::npos;
     }
 }
 

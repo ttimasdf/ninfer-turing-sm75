@@ -14,6 +14,7 @@
 #include "ninfer/ops/softmax_attention.h"
 
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <algorithm>
 #include <stdexcept>
@@ -21,6 +22,22 @@
 #include <string_view>
 
 namespace ninfer::ops::detail {
+namespace small_t_i8 {
+
+// Defined here (not in the header) so the once-per-process flag is shared by every width unit that
+// calls small_t_i8_wide_arena_fits, instead of printing once per translation unit.
+void note_small_t_narrow_arena() {
+    static const bool once = [] {
+        std::fprintf(stderr,
+                     "small-T attention: 32-key tiles; this device's shared-memory ceiling cannot "
+                     "hold the 65536-byte 64-key dynamic arena plus the kernel's static shared "
+                     "memory\n");
+        return true;
+    }();
+    (void)once;
+}
+
+} // namespace small_t_i8
 
 std::string small_t_i8_route_key(std::int32_t q_heads, KvCacheStorage storage,
                                  std::int32_t width) {

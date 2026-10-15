@@ -28,6 +28,23 @@ inline bool small_t_pv_f16() {
     return device_route_schedule("attn_pv_f16", 1) == "on";
 }
 
+// Says once per process--from small_t.cu, so the note is not repeated per width unit--why the
+// small-T route dropped to 32-key tiles.
+void note_small_t_narrow_arena();
+
+// Whether this device can stage 64-key tiles with the tiled kernel's dynamic arena. That arena is
+// exactly 4*64*kCausalHeadDim = 65,536 bytes of dynamic shared memory, and the kernel always
+// declares static shared arrays too (the Q tile, the score tile, the scale rows, the page ids — about
+// 20 KiB at TokenTile 8), while cudaFuncSetAttribute accepts a dynamic request only when
+// dynamic + static fit the opt-in ceiling. A part whose ceiling is exactly 64 KiB (Turing) can
+// therefore never hold it, and must run the 32-key static arena instead; any wider part has already
+// been measured to accept it.
+inline bool small_t_i8_wide_arena_fits() {
+    if (max_dynamic_shared_bytes() > 4 * 64 * kCausalHeadDim) { return true; }
+    note_small_t_narrow_arena();
+    return false;
+}
+
 template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, typename CacheInput>
 void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, float scale,
                           PagedKVBatchLayerView cache, const CausalSmallTInvocation& invocation,
@@ -157,7 +174,11 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
             } else if (routed == "12x1x32") {
                 launch.template operator()<12, 1, 32, false>();
             } else if (routed == "12x1x64d") {
-                launch.template operator()<12, 1, 64, true>();
+                if (small_t_i8_wide_arena_fits()) {
+                    launch.template operator()<12, 1, 64, true>();
+                } else {
+                    taken = false; // 64-key arena too wide for this part; use the default selection
+                }
             } else if (routed == "24x1x32") {
                 launch.template operator()<24, 1, 32, false>();
             } else if (routed == "6x2x32q") {
@@ -188,8 +209,12 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
             launch.template operator()<24, 1, 32, false>();
         } else if (implementation_window <= 2054) {
             launch.template operator()<12, 1, 32, false>();
-        } else if (implementation_window <= 8198) {
+        } else if (implementation_window <= 8198 && small_t_i8_wide_arena_fits()) {
             launch.template operator()<12, 1, 64, true>();
+        } else if (implementation_window <= 8198) {
+            // A 64 KiB part cannot hold the 64-key dynamic arena (see small_t_i8_wide_arena_fits);
+            // the 32-key static arena is the schedule the <= 2054 tier already runs.
+            launch.template operator()<12, 1, 32, false>();
         } else {
             launch.template operator()<6, 2, 32, false>();
         }

@@ -36,10 +36,12 @@ void require_dynamic_shared_bytes(int bytes, const char* what);
 // Reserves `bytes` of dynamic shared memory per block for one kernel on the current device, naming
 // the kernel in every failure. cudaFuncSetAttribute reports an over-sized request as a bare
 // cudaErrorInvalidValue carrying no kernel identity -- which is why an over-sized Turing schedule
-// used to abort the process unattributed -- so this wrapper asks the device for its ceiling first,
-// refuses a request the device cannot hold, and names the kernel (cudaFuncGetName, whose mangled
-// symbol a launcher cannot spell) in both that message and a rejected attribute call. It is a
-// drop-in replacement for
+// used to abort the process unattributed -- and it accepts the request only when the dynamic arena
+// plus the kernel's own static shared memory fit the opt-in ceiling (a 64 KiB Turing part therefore
+// rejects a 64 KiB arena on a kernel with any static shared array). This wrapper asks the device for
+// its ceiling and the kernel for its static size first, refuses what cannot fit, and names the
+// kernel (cudaFuncGetName, whose mangled symbol a launcher cannot spell) in both that message and a
+// rejected attribute call. It is a drop-in replacement for
 //   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes)
 // and resolves the kernel's name only on the paths that fail, so the success path costs only the
 // cached ceiling read.
