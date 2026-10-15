@@ -1,6 +1,8 @@
 #include "ops/linear_attention/gated_delta_net/chunked/launch.h"
 #include "ops/linear_attention/gated_delta_net/chunked/output.cuh"
 
+#include "core/device.h"
+
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -27,8 +29,8 @@ std::int64_t resident_wave_ctas() {
     int blocks = 0;
     constexpr int smem_bytes = kernel::kernel_dims::SMEM_BYTES;
     if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess ||
-        cudaFuncSetAttribute(kernel::output_kernel<MULTI_JOB>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes) != cudaSuccess ||
+        set_max_dynamic_shared_memory(kernel::output_kernel<MULTI_JOB>, smem_bytes) !=
+            cudaSuccess ||
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel::output_kernel<MULTI_JOB>,
                                                       kernel::THREADS, smem_bytes) != cudaSuccess ||
         sms <= 0 || blocks <= 0) {
@@ -44,8 +46,7 @@ template <bool MULTI_JOB>
 cudaError_t launch_fixed(const chunk_output_config& cfg, dim3 grid, head_map qk_map, int chunks) {
     constexpr int smem_bytes = kernel::kernel_dims::SMEM_BYTES;
 
-    cudaError_t err = cudaFuncSetAttribute(kernel::output_kernel<MULTI_JOB>,
-                                           cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+    cudaError_t err = set_max_dynamic_shared_memory(kernel::output_kernel<MULTI_JOB>, smem_bytes);
     if (err != cudaSuccess) { return err; }
 
     const dim3 block(kernel::THREADS, 1, 1);

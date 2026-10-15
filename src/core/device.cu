@@ -9,6 +9,10 @@
 #include <string_view>
 #include <vector>
 
+#if defined(__GNUG__)
+#include <cxxabi.h>
+#endif
+
 namespace ninfer {
 namespace {
 
@@ -93,6 +97,62 @@ void require_dynamic_shared_bytes(int bytes, const char* what) {
     throw std::runtime_error(std::string(what) + " needs " + std::to_string(bytes) +
                              " bytes of dynamic shared memory per block; this device grants " +
                              std::to_string(ceiling));
+}
+
+namespace {
+
+// The kernel's name as cudaFuncGetName reports it, demangled where the toolchain can (GNU reports a
+// mangled symbol for a template instantiation, which is exactly the identity a launcher cannot
+// spell). "<unnamed kernel>" for a symbol the runtime does not recognize -- e.g. a nullptr or a
+// cudaKernel_t handle -- so a failure message always has a name field.
+std::string kernel_entry_name(const void* entry) {
+    if (entry == nullptr) { return "<null kernel>"; }
+    const char* reported = nullptr;
+    if (::cudaFuncGetName(&reported, entry) != cudaSuccess || reported == nullptr) {
+        // Do not leave the lookup's failure as the thread's last error.
+        (void)cudaGetLastError();
+        return "<unnamed kernel>";
+    }
+    std::string name(reported);
+#if defined(__GNUG__)
+    int status = 0;
+    char* readable = abi::__cxa_demangle(reported, nullptr, nullptr, &status);
+    if (status == 0 && readable != nullptr) { name.assign(readable); }
+    std::free(readable);
+#endif
+    return name;
+}
+
+[[noreturn]] void throw_dynamic_shared_bytes(const void* kernel, int bytes, int ceiling) {
+    const std::string name = kernel_entry_name(kernel);
+    int device = 0;
+    (void)cudaGetDevice(&device);
+    std::fprintf(stderr,
+                 "kernel %s needs %d bytes of dynamic shared memory per block; device %d grants "
+                 "%d\n",
+                 name.c_str(), bytes, device, ceiling);
+    throw std::runtime_error("kernel " + name + " needs " + std::to_string(bytes) +
+                             " bytes of dynamic shared memory per block; this device grants " +
+                             std::to_string(ceiling));
+}
+
+} // namespace
+
+cudaError_t set_max_dynamic_shared_memory(const void* kernel, int bytes) {
+    const int ceiling = max_dynamic_shared_bytes();
+    if (bytes > ceiling) { throw_dynamic_shared_bytes(kernel, bytes, ceiling); }
+    const cudaError_t result = ::cudaFuncSetAttribute(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+    if (result != cudaSuccess) {
+        const std::string name = kernel_entry_name(kernel);
+        int device             = 0;
+        (void)cudaGetDevice(&device);
+        std::fprintf(stderr,
+                     "cudaFuncSetAttribute(MaxDynamicSharedMemorySize, %d) failed for kernel %s "
+                     "on device %d: %s\n",
+                     bytes, name.c_str(), device, cudaGetErrorName(result));
+    }
+    return result;
 }
 
 int memory_device(const void* pointer) {

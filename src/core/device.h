@@ -33,6 +33,23 @@ int max_dynamic_shared_bytes();
 // std::runtime_error; `what` names the route and, where there is one, the alternative to use.
 void require_dynamic_shared_bytes(int bytes, const char* what);
 
+// Reserves `bytes` of dynamic shared memory per block for one kernel on the current device, naming
+// the kernel in every failure. cudaFuncSetAttribute reports an over-sized request as a bare
+// cudaErrorInvalidValue carrying no kernel identity -- which is why an over-sized Turing schedule
+// used to abort the process unattributed -- so this wrapper asks the device for its ceiling first,
+// refuses a request the device cannot hold, and names the kernel (cudaFuncGetName, whose mangled
+// symbol a launcher cannot spell) in both that message and a rejected attribute call. It is a
+// drop-in replacement for
+//   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes)
+// and resolves the kernel's name only on the paths that fail, so the success path costs only the
+// cached ceiling read.
+cudaError_t set_max_dynamic_shared_memory(const void* kernel, int bytes);
+
+template <typename Entry>
+cudaError_t set_max_dynamic_shared_memory(Entry* kernel, int bytes) {
+    return set_max_dynamic_shared_memory(reinterpret_cast<const void*>(kernel), bytes);
+}
+
 #define CUDA_CHECK(expr) ::ninfer::cuda_check((expr), #expr, __FILE__, __LINE__)
 
 // Non-owning execution facts passed to Ops whose launch policy depends on physical device

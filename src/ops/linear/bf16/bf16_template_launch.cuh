@@ -32,8 +32,7 @@ void launch_bf16_a16_gemv(const Bf16A16Operands& p, Output output, Epilogue epil
         bytes = p.k * 2;
         if (bytes + static_bytes > 48 * 1024) {
             configure_cuda_device_once([&, kernel] {
-                return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                            max_dynamic);
+                return set_max_dynamic_shared_memory(kernel, max_dynamic);
             });
         }
     }

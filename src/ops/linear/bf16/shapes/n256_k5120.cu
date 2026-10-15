@@ -12,9 +12,8 @@ void launch_chunk(const __nv_bfloat16* x, const __nv_bfloat16* weight, __nv_bflo
     constexpr int kRowTiles = 256 / Schedule::kOutputRowsPerCta;
     const dim3 grid(kRowTiles, (tokens + Schedule::kTileTokens - 1) / Schedule::kTileTokens);
     configure_cuda_device_once([] {
-        return cudaFuncSetAttribute(bf16_n256_k5120_mma_kernel<Schedule>,
-                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                    Schedule::kSharedBytes);
+        return set_max_dynamic_shared_memory(bf16_n256_k5120_mma_kernel<Schedule>,
+                                             Schedule::kSharedBytes);
     });
     CUDA_CHECK(
         pdl::launch_consumer({dim3(grid), dim3(Schedule::kThreads), Schedule::kSharedBytes, stream},

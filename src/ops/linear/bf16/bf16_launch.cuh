@@ -40,9 +40,9 @@ void launch_bf16_mma_variant(const Tensor& x, const Weight& weight, Tensor& out,
                                          Geometry::kOutputRows};
     if constexpr (Schedule::kSharedBytes > 48 * 1024) {
         configure_cuda_device_once([&] {
-            return cudaFuncSetAttribute(
+            return set_max_dynamic_shared_memory(
                 bf16_gemm_mma_kernel<Geometry, Schedule, FullTokens, Bf16MmaContiguousOutput>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, Schedule::kSharedBytes);
+                Schedule::kSharedBytes);
         });
     }
     bf16_gemm_mma_kernel<Geometry, Schedule, FullTokens>

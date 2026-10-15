@@ -44,8 +44,7 @@ void launch_range(const Weight& weight, const std::int8_t* codes, const __half* 
     auto* kernel = a8::a8_mma_kernel<Codec, kHidden, 1, NT, Rows, a8::StoreEpilogue>;
     if (smem > 48 * 1024) {
         configure_cuda_device_once([&] {
-            return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        static_cast<int>(smem));
+            return set_max_dynamic_shared_memory(kernel, static_cast<int>(smem));
         });
     }
     kernel<<<grid, a8::kThreads, smem, stream>>>(

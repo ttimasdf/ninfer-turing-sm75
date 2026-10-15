@@ -285,8 +285,8 @@ void launch_tile(const Tensor& hidden, const Weight& head, const Tensor& row_to_
                  const LinearTopKWorkspace& workspace, cudaStream_t stream) {
     constexpr int shared_bytes = sizeof(Q4M64ReusableStorage<TileColumns, kBlockK>);
     if constexpr (shared_bytes > 48 * 1024) {
-        CUDA_CHECK(cudaFuncSetAttribute(q4_m64_linear_topk_kernel<TileColumns, kBlockK>,
-                                        cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
+        CUDA_CHECK(set_max_dynamic_shared_memory(q4_m64_linear_topk_kernel<TileColumns, kBlockK>,
+                                                 shared_bytes));
     }
     q4_m64_linear_topk_kernel<TileColumns, kBlockK>
         <<<dim3(workspace.producer_groups, div_up(hidden.ne[1], TileColumns)),

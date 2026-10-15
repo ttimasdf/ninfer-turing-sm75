@@ -19,9 +19,8 @@ void causal_attention_prompt_fp8_attention_launch_for(const Tensor& q, const Ten
                                                       cudaStream_t stream) {
     require_dynamic_shared_bytes(kCausalPromptFp8SmemBytes, "the prompt-attention kernel for fp8 caches (--kv-dtype fp8)");
     configure_cuda_device_once([&] {
-        return cudaFuncSetAttribute(
-            causal_attention_prompt_fp8_kernel<Geometry, Metadata>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, kCausalPromptFp8SmemBytes);
+        return set_max_dynamic_shared_memory(causal_attention_prompt_fp8_kernel<Geometry, Metadata>,
+                                             kCausalPromptFp8SmemBytes);
     });
 
     constexpr auto kStorage = KvCacheStorage::Fp8E4M3Row256;

@@ -1,6 +1,8 @@
 #include "ops/linear_attention/gated_delta_net/chunked/launch.h"
 #include "ops/linear_attention/gated_delta_net/chunked/prepare_wy_wu.cuh"
 
+#include "core/device.h"
+
 namespace ninfer::ops::detail::gated_delta_net::chunked {
 namespace {
 
@@ -12,9 +14,8 @@ cudaError_t launch_fixed(const prepare_wy_wu_config& cfg, dim3 grid, head_map qk
     constexpr int smem_bytes = dims::SMEM_FLOATS * static_cast<int>(sizeof(float));
     constexpr int threads    = BlockWarps * ninfer::ops::kWarpSize;
 
-    cudaError_t err =
-        cudaFuncSetAttribute(kernel::prepare_wy_wu_kernel<KPanelCols, WuPanelCols, BlockWarps>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+    cudaError_t err = set_max_dynamic_shared_memory(
+        kernel::prepare_wy_wu_kernel<KPanelCols, WuPanelCols, BlockWarps>, smem_bytes);
     if (err != cudaSuccess) { return err; }
 
     kernel::prepare_wy_wu_kernel<KPanelCols, WuPanelCols, BlockWarps>

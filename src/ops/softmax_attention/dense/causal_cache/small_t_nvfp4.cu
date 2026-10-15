@@ -29,8 +29,7 @@ void launch_nvfp4_partial(const Tensor& q, CacheInput input, const Tensor& posit
         auto kernel = causal_attention_small_t_nvfp4_tiled_kernel<
             Geometry, TokenTile, Warps, MinBlocks, KeyBlock, true, MultiBatch, Masked, KernelInput>;
         configure_cuda_device_once([&] {
-            return cudaFuncSetAttribute(
-                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(DynamicBytes));
+            return set_max_dynamic_shared_memory(kernel, static_cast<int>(DynamicBytes));
         });
 
         const auto q_ptr         = static_cast<const __nv_bfloat16*>(q.data);

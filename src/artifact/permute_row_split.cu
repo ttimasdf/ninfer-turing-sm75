@@ -1,6 +1,7 @@
 #include "artifact/permute_row_split.h"
 
 #include "artifact/schema.h"
+#include "core/device.h"
 #include "core/weight.h"
 
 #include <cuda_runtime.h>
@@ -56,9 +57,7 @@ void permute_plane(std::byte* data, int groups, int bytes_per_group, long long r
     if (shared > 96u * 1024u) {
         throw ArtifactError("panel permute needs more shared memory than the device offers");
     }
-    check_cuda(cudaFuncSetAttribute(permute_panel_kernel,
-                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                    static_cast<int>(shared)),
+    check_cuda(set_max_dynamic_shared_memory(permute_panel_kernel, static_cast<int>(shared)),
                "raise shared memory for the panel permute");
     permute_panel_kernel<<<static_cast<unsigned>(panels), kThreads, shared, stream>>>(
         data, groups, bytes_per_group, panels);

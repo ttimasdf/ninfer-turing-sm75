@@ -43,8 +43,7 @@ void launch(const Tensor& x, const Weight& down, Tensor& residual, std::int32_t 
     auto* kernel = a8::a8_mma_kernel<Codec, kCols, 1, NT, Rows, a8::ResidualAddEpilogue>;
     if (smem > 48 * 1024) {
         configure_cuda_device_once([&] {
-            return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        static_cast<int>(smem));
+            return set_max_dynamic_shared_memory(kernel, static_cast<int>(smem));
         });
     }
     kernel<<<grid, a8::kThreads, smem, stream>>>(

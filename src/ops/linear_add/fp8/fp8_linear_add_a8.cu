@@ -30,10 +30,10 @@ void launch_mma(const Weight& weight, Tensor& residual, Fp8A8Workspace workspace
 
     if constexpr (Schedule::kSharedBytes > 48 * 1024) {
         configure_cuda_device_once([&] {
-            return cudaFuncSetAttribute(
+            return set_max_dynamic_shared_memory(
                 fp8_mma_kernel<Geometry, Schedule, FullTokens, Fp8AddResidualEpilogue,
                                Fp8ContiguousOutput>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, Schedule::kSharedBytes);
+                Schedule::kSharedBytes);
         });
     }
     fp8_mma_kernel<Geometry, Schedule, FullTokens>

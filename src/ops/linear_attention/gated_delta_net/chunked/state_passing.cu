@@ -1,6 +1,8 @@
 #include "ops/linear_attention/gated_delta_net/chunked/launch.h"
 #include "ops/linear_attention/gated_delta_net/chunked/state_passing.cuh"
 
+#include "core/device.h"
+
 namespace ninfer::ops::detail::gated_delta_net::chunked {
 namespace {
 
@@ -12,8 +14,8 @@ cudaError_t launch_fixed(const state_passing_config& cfg, head_map qk_map, int N
     constexpr int smem_bytes =
         kernel::smem_layout<NStrip>::SMEM_FLOATS * static_cast<int>(sizeof(float));
 
-    cudaError_t err = cudaFuncSetAttribute(kernel::state_passing_kernel<NStrip>,
-                                           cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+    cudaError_t err =
+        set_max_dynamic_shared_memory(kernel::state_passing_kernel<NStrip>, smem_bytes);
     if (err != cudaSuccess) { return err; }
 
     const dim3 grid(static_cast<unsigned>(static_cast<std::int64_t>(cfg.H_v) * D::D_STRIPS), 1, 1);

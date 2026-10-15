@@ -314,8 +314,8 @@ void launch_mma(const Tensor& x, const Tensor& positions, const Tensor& counts, 
                 const Tensor& scratch, cudaStream_t stream) {
     constexpr int bytes = sizeof(MaterializeStorage<Rows, Columns, BlockK>);
     if constexpr (bytes > 48 * 1024)
-        CUDA_CHECK(cudaFuncSetAttribute(context_kv_mma_kernel<Rows, Columns, BlockK, ColumnWarps>,
-                                        cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+        CUDA_CHECK(set_max_dynamic_shared_memory(
+            context_kv_mma_kernel<Rows, Columns, BlockK, ColumnWarps>, bytes));
     context_kv_mma_kernel<Rows, Columns, BlockK, ColumnWarps>
         <<<dim3(1024 / Rows, (envelope.max_count * x.ne[2] + Columns - 1) / Columns, 10),
            Rows / 16 * ColumnWarps * 32, bytes, stream>>>(

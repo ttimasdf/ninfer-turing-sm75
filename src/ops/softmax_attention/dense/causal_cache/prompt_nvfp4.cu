@@ -19,9 +19,8 @@ void causal_attention_prompt_nvfp4_attention_launch_for(const Tensor& q, const T
                                                         cudaStream_t stream) {
     require_dynamic_shared_bytes(kCausalPromptNvfp4SmemBytes, "the prompt-attention kernel for nvfp4 caches (--kv-dtype nvfp4)");
     configure_cuda_device_once([&] {
-        return cudaFuncSetAttribute(
-            causal_attention_prompt_nvfp4_kernel<Geometry, Metadata>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, kCausalPromptNvfp4SmemBytes);
+        return set_max_dynamic_shared_memory(
+            causal_attention_prompt_nvfp4_kernel<Geometry, Metadata>, kCausalPromptNvfp4SmemBytes);
     });
 
     constexpr auto kStorage = KvCacheStorage::Nvfp4Group16;

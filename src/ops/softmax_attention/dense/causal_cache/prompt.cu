@@ -109,8 +109,7 @@ void causal_attention_prompt_i8_fast_launch_for(const Tensor& q, const Tensor& p
             "the fast int8-family prompt-attention kernel (--kv-dtype int8, rk8v4, rk4v4 or "
             "rk2v4-e8; bf16 serves this device)");
         configure_cuda_device_once([&] {
-            return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        Shape::SmemBytes);
+            return set_max_dynamic_shared_memory(kernel, Shape::SmemBytes);
         });
         const dim3 grid(static_cast<unsigned>(div_up(tokens, Shape::Br)),
                         static_cast<unsigned>(Geometry::QHeads), 1u);
@@ -194,8 +193,7 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
                         "the int8-family prompt-attention kernel (--kv-dtype int8, rk8v4, rk4v4 or "
                         "rk2v4-e8; bf16 serves this device)");
                     configure_cuda_device_once([&] {
-                        return cudaFuncSetAttribute(
-                            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem);
+                        return set_max_dynamic_shared_memory(kernel, kSmem);
                     });
                     const dim3 grid =
                         PackGqa ? dim3(static_cast<unsigned>(
@@ -255,8 +253,8 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
         const auto launch = [&]<int Bc>() {
             constexpr int kSmem = causal_prompt_smem_bytes<kCausalPromptBr, Bc>();
             configure_cuda_device_once([&] {
-                return cudaFuncSetAttribute(causal_attention_prompt_bf16_kernel<Geometry, Metadata, Bc>,
-                                            cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem);
+                return set_max_dynamic_shared_memory(
+                    causal_attention_prompt_bf16_kernel<Geometry, Metadata, Bc>, kSmem);
             });
             causal_attention_prompt_bf16_kernel<Geometry, Metadata, Bc>
                 <<<attention_grid, kCausalPromptThreads, kSmem, stream>>>(

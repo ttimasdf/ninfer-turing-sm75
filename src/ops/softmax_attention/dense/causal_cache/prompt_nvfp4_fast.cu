@@ -48,8 +48,7 @@ void launch_fast_for(const Tensor& q, const Tensor& positions, const Tensor* val
                 "the fast prompt-attention kernel for rotated/nvfp4 caches (--kv-dtype nvfp4, "
                 "rk2v4-e8 or rk4v4-e8)");
             configure_cuda_device_once([&] {
-                return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                            Shape::SmemBytes);
+                return set_max_dynamic_shared_memory(kernel, Shape::SmemBytes);
             });
             const dim3 grid(div_up(width, Shape::Br), G::QHeads, plan.splits);
             kernel<<<grid, Shape::Threads, Shape::SmemBytes, stream>>>(
