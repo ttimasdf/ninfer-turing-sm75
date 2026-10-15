@@ -5,6 +5,7 @@
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_gemm_mma.cuh"
+#include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_residency.h"
 
 #include "core/device.h" // CUDA_CHECK
 
@@ -363,10 +364,16 @@ bool launch_bf16_prefill_mma(Bf16GdnGatingTokenVariant variant, const Tensor& x,
     } else {
         constexpr std::int64_t kCtasPerTokenTile =
             static_cast<std::int64_t>(Geometry::kHeads / kBf16GdnBlockM) * SplitK;
-        constexpr std::int32_t kResidentCtasPerSm =
-            cooperative_resident_ctas_per_sm<Geometry, SplitK>();
+        // Clamp the measured sm_86 residency by what this device's shared memory admits: Turing's
+        // 64 KiB SM seats one 40 KiB CTA where sm_86 seats two, so the sm_86 budget would chunk a
+        // wide prefill into a cooperative grid larger than the device holds and the driver would
+        // reject it with cudaErrorCooperativeLaunchTooLarge. See
+        // bf16_gdn_gating_proj_residency.h.
+        const std::int32_t resident_ctas_per_sm =
+            std::min(cooperative_resident_ctas_per_sm<Geometry, SplitK>(),
+                     shared_memory_ctas_per_sm(kSmemBytes));
         const std::int64_t resident_ctas =
-            static_cast<std::int64_t>(multiprocessor_count) * kResidentCtasPerSm;
+            static_cast<std::int64_t>(multiprocessor_count) * resident_ctas_per_sm;
         const std::int64_t max_token_tiles = resident_ctas / kCtasPerTokenTile;
         if (max_token_tiles < 1) { return false; }
 

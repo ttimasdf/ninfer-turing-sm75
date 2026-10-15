@@ -1,6 +1,8 @@
 #include "core/weight.h"
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.h"
 
+#include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_residency.h"
+
 #include "ninfer/ops/hadamard_transform.h"
 #include "ninfer/ops/rmsnorm.h"
 
@@ -120,11 +122,21 @@ std::int32_t device_sm_count() noexcept {
 }
 
 std::int32_t resident_ctas_27(Bf16GdnGatingScheduleId schedule, std::int32_t sm_count) noexcept {
-    return ctas_per_sm_27(schedule) * sm_count;
+    // sm_86 has 100 KiB of shared memory per SM and seats two of the 27B BN128 kernel's 40 KiB
+    // CTAs; a Turing SM (64 KiB) seats one. Clamp the measured sm_86 figure by what the active
+    // device admits, or a cooperative grid the sm_86 predicate calls resident is rejected by the
+    // driver (cudaErrorCooperativeLaunchTooLarge). See bf16_gdn_gating_proj_residency.h.
+    constexpr std::int32_t kCtaSmemBytes = 40960; // 2 stages of 128x64 + 2 x 16x64 bf16
+    const std::int32_t per_sm =
+        std::min(ctas_per_sm_27(schedule), shared_memory_ctas_per_sm(kCtaSmemBytes));
+    return per_sm * sm_count;
 }
 
 std::int32_t resident_ctas_35(Bf16GdnGatingScheduleId schedule, std::int32_t sm_count) noexcept {
-    return ctas_per_sm_35(schedule) * sm_count;
+    constexpr std::int32_t kCtaSmemBytes = 24576; // 2 stages of 64x64 + 2 x 16x64 bf16
+    const std::int32_t per_sm =
+        std::min(ctas_per_sm_35(schedule), shared_memory_ctas_per_sm(kCtaSmemBytes));
+    return per_sm * sm_count;
 }
 
 // Zero marks a schedule that is not launched cooperatively and therefore carries no residency
